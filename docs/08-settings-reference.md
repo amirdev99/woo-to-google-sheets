@@ -1,0 +1,164 @@
+# 08 — Settings reference
+
+Every configuration value the plugin stores, where it comes from, and who reads it.
+
+## The storage rule
+
+All plugin settings live in **one** option, `wtg_settings`, holding an array of eight keys.
+`includes/class-settings.php` is the only file that calls `get_option()` / `update_option()`
+for it — nothing else touches WordPress options directly.
+
+Defaults come from `Settings::defaults()`, merged over stored values by `wp_parse_args()` in
+`Settings::all()`, so a key that was never saved still returns a predictable type.
+
+---
+
+## `wtg_settings` — the eight keys
+
+### User-entered (the Connection tab form)
+
+| Key | Default | Type | Written by | Read by |
+|---|---|---|---|---|
+| `client_id` | `''` | string | `Settings_Page::sanitize()` | `OAuth_Client::has_credentials()`, `get_authorize_url()`, `exchange_code()`, `refresh_access_token()` |
+| `client_secret` | `''` | string | `Settings_Page::sanitize()` | `OAuth_Client::has_credentials()`, `exchange_code()`, `refresh_access_token()` |
+| `spreadsheet_id` | `''` | string | `Settings_Page::sanitize()` | `Sync_Processor::process()`, `OAuth_Controller::handle_test()` |
+| `sheet_name` | `'Sheet1'` | string | `Settings_Page::sanitize()` | `Sync_Processor::process()` |
+
+**`client_id`** — the OAuth client ID from Google Cloud Console, ending
+`.apps.googleusercontent.com`. Rendered by `render_field_client_id()` as a normal text input
+showing its current value.
+
+**`client_secret`** — rendered by `render_field_client_secret()` as a **password** input with
+`value=""`, always. The stored secret is never echoed into page source. Because the field is
+always blank, `sanitize()` treats a blank submission as *"keep the existing secret"*:
+
+```php
+$submitted_secret = isset( $input['client_secret'] ) ? trim( $input['client_secret'] ) : '';
+if ( '' !== $submitted_secret ) {
+    $output['client_secret'] = sanitize_text_field( $submitted_secret );
+}
+```
+
+There is deliberately **no way to clear the secret from the form** — you would disconnect, or
+overwrite it with a new value.
+
+**`spreadsheet_id`** — the long ID from the sheet URL,
+`docs.google.com/spreadsheets/d/`**`THIS_PART`**`/edit`. If empty, `Sync_Processor::process()`
+returns early and rows stay `pending`.
+
+**`sheet_name`** — the tab name. `sanitize()` falls back to `'Sheet1'` when submitted empty,
+so the processor always has a target. Passed through `Sheets_Client::a1_sheet()`, which quotes
+it — so tab names with spaces work.
+
+### Written only by the OAuth flow
+
+These four have **no form fields**. They are written exclusively by `OAuth_Client`.
+
+| Key | Default | Type | Written by | Read by |
+|---|---|---|---|---|
+| `access_token` | `''` | string | `OAuth_Client::store_tokens()`, cleared by `disconnect()` / `flag_reauth_needed()` | `OAuth_Client::get_valid_access_token()` |
+| `refresh_token` | `''` | string | `OAuth_Client::store_tokens()`, cleared by `disconnect()` / `flag_reauth_needed()` | `OAuth_Client::is_connected()`, `refresh_access_token()`, `disconnect()` |
+| `token_expires` | `0` | int (Unix ts) | `OAuth_Client::store_tokens()` | `OAuth_Client::is_token_expired()` |
+| `reauth_needed` | `false` | bool | `OAuth_Client::exchange_code()`, `disconnect()`, `flag_reauth_needed()` | `OAuth_Controller::render_reauth_notice()` |
+
+**`access_token`** — short-lived (about an hour). Never used directly; callers go through
+`get_valid_access_token()`, which refreshes transparently.
+
+**`refresh_token`** — the important one. `OAuth_Client::is_connected()` is defined purely as
+*"is this non-empty?"*, so **this key is the definition of "connected"**. Losing it means
+reconnecting.
+
+**`token_expires`** — stored as an **absolute** timestamp (`time() + expires_in`), not a
+duration, so expiry is a simple comparison. `is_token_expired()` applies a 60-second buffer.
+
+**`reauth_needed`** — set true only when a refresh fails with Google's `invalid_grant`,
+meaning the refresh token is dead. Drives the persistent admin warning. Cleared on a
+successful connect and on an intentional disconnect.
+
+### ⚠️ The sanitize passthrough
+
+Because `Settings_Page::register_settings()` registers the option with a `sanitize_callback`,
+WordPress runs `Settings_Page::sanitize()` on **every** `update_option( 'wtg_settings', … )` —
+including `OAuth_Client`'s own token writes, via the `sanitize_option_wtg_settings` filter.
+
+That is why `sanitize()` contains this loop:
+
+```php
+foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_needed' ) as $internal_key ) {
+    if ( array_key_exists( $internal_key, $input ) ) {
+        $output[ $internal_key ] = $input[ $internal_key ];
+    }
+}
+```
+
+**If you add a new non-form setting written programmatically, you must add its key here**, or
+it will be silently stripped every time it is saved.
+
+### Not stored: `redirect_uri`
+
+The Connection tab shows a Redirect URI field, but it is **read-only and never saved**. It is
+computed live by `OAuth_Client::redirect_uri()` on each render, so it always matches the
+site's current URL. `sanitize()` has an explicit comment saying so.
+
+---
+
+## `wtg_db_version` — the second option
+
+| | |
+|---|---|
+| Key | `wtg_db_version` (`Activator::DB_VERSION_OPTION`) |
+| Value | `WTG_VERSION`, currently `'0.1.0'` |
+| Written by | `Activator::create_table()` |
+| Read by | **nothing** |
+| Deleted by | `uninstall.php` |
+
+Written on every activation, read by no code today. It exists so a future schema change can
+compare it against `WTG_VERSION` and run a migration — see `10-extending-the-plugin.md`.
+
+It is also a useful diagnostic: if `wtg_db_version` exists but `wtg_settings` does not, the
+plugin was activated but never configured.
+
+---
+
+## Reading and writing settings in your own code
+
+```php
+use WTG\Settings;
+
+$sheet = Settings::get( 'sheet_name', 'Sheet1' );   // single value
+$all   = Settings::all();                           // whole array, defaults merged
+
+Settings::set( 'sheet_name', 'Orders 2026' );       // one key
+Settings::update( array(                            // several at once
+    'sheet_name'     => 'Orders 2026',
+    'spreadsheet_id' => '1abc…',
+) );
+
+Settings::delete( 'sheet_name' );                   // revert to default
+```
+
+Three things to know:
+
+1. **`set()` and `update()` both trigger `sanitize()`** because of the registered callback.
+   Unknown keys survive (the callback starts from the existing array), but any key that
+   `sanitize()` explicitly rewrites will be normalised.
+2. **`get()` uses `array_key_exists()`, not `isset()`** — so a stored `null` is returned as
+   `null` rather than falling through to the default.
+3. **`update()` merges, it does not replace.** Keys you omit are left alone.
+
+---
+
+## Quick diagnostics
+
+```sql
+SELECT option_value FROM wp_options WHERE option_name = 'wtg_settings';
+SELECT option_value FROM wp_options WHERE option_name = 'wtg_db_version';
+```
+
+| Symptom | Likely meaning |
+|---|---|
+| `wtg_settings` row missing entirely | Never saved, or deleted outside the plugin. Everything falls back to defaults, `is_connected()` is false |
+| `refresh_token` empty but `client_id` set | Credentials saved, account never connected (or disconnected) |
+| `reauth_needed` is `true` | Refresh token died — Google returned `invalid_grant`. Reconnect |
+| `token_expires` in the past | Normal. The next `get_valid_access_token()` refreshes automatically |
+| `wtg_db_version` present, `wtg_settings` absent | Plugin activated but never configured |
