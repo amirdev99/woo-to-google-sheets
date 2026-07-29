@@ -13,6 +13,8 @@ namespace WTG\Admin;
 
 use WTG\Settings;
 use WTG\Google\OAuth_Client;
+use WTG\Google\Sheets_Client;
+use WTG\WooCommerce\Order_Mapper;
 
 // Block direct access.
 if ( ! defined( 'ABSPATH' ) ) {
@@ -40,6 +42,11 @@ class OAuth_Controller {
 	const ACTION_TEST = 'wtg_test_connection';
 
 	/**
+	 * admin-post action that writes the column labels into row 1 of the sheet.
+	 */
+	const ACTION_WRITE_HEADER = 'wtg_write_header';
+
+	/**
 	 * Nonce action used for the OAuth `state` parameter (CSRF for the callback).
 	 */
 	const STATE_ACTION = 'wtg_oauth_state';
@@ -61,6 +68,7 @@ class OAuth_Controller {
 		add_action( 'admin_post_' . OAuth_Client::ACTION_CALLBACK, array( $this, 'handle_callback' ) );
 		add_action( 'admin_post_' . self::ACTION_DISCONNECT, array( $this, 'handle_disconnect' ) );
 		add_action( 'admin_post_' . self::ACTION_TEST, array( $this, 'handle_test' ) );
+		add_action( 'admin_post_' . self::ACTION_WRITE_HEADER, array( $this, 'handle_write_header' ) );
 
 		add_action( 'admin_notices', array( $this, 'render_notice' ) );
 		// Persistent warning shown until the user reconnects an expired account.
@@ -96,6 +104,15 @@ class OAuth_Controller {
 	 */
 	public static function test_url() {
 		return wp_nonce_url( admin_url( 'admin-post.php?action=' . self::ACTION_TEST ), self::ACTION_TEST );
+	}
+
+	/**
+	 * Nonced URL that writes the header row.
+	 *
+	 * @return string
+	 */
+	public static function write_header_url() {
+		return wp_nonce_url( admin_url( 'admin-post.php?action=' . self::ACTION_WRITE_HEADER ), self::ACTION_WRITE_HEADER );
 	}
 
 	/* ---------------------------------------------------------------------- *
@@ -218,9 +235,116 @@ class OAuth_Controller {
 		$this->redirect_to_settings();
 	}
 
+	/**
+	 * Write the column labels into row 1 of the configured sheet.
+	 *
+	 * The labels come from Order_Mapper::header(), the SAME source the sync uses
+	 * to build data rows, so the header can never disagree with what is written
+	 * beneath it.
+	 *
+	 * Row 1 may already hold something, so we read it first and branch four ways:
+	 *
+	 *   - blank            -> write the header
+	 *   - the same header  -> do nothing, report success (clicking twice is safe)
+	 *   - a different header -> overwrite it; that is the point of the button
+	 *   - ORDER DATA       -> refuse
+	 *
+	 * That last case matters: if syncing started before a header existed, row 1 is
+	 * a real order, and blindly writing over it would destroy a record. Refusing
+	 * matches how the processor already behaves when it cannot reconcile safely.
+	 *
+	 * @return void
+	 */
+	public function handle_write_header() {
+		$this->authorize( self::ACTION_WRITE_HEADER );
+
+		// get_valid_access_token() refreshes transparently if needed.
+		$token = ( new OAuth_Client() )->get_valid_access_token();
+		if ( is_wp_error( $token ) ) {
+			$this->set_notice( 'error', $token->get_error_message() );
+			$this->redirect_to_settings();
+		}
+
+		$spreadsheet_id = Settings::get( 'spreadsheet_id', '' );
+		if ( '' === $spreadsheet_id ) {
+			$this->set_notice( 'error', __( 'Enter a Spreadsheet ID first, then Save.', 'woo-to-gsheet' ) );
+			$this->redirect_to_settings();
+		}
+
+		$sheet_name = Settings::get( 'sheet_name', 'Sheet1' );
+		$sheets     = new Sheets_Client();
+
+		$existing = $sheets->read_row( $spreadsheet_id, $sheet_name, 1, $token );
+		if ( is_wp_error( $existing ) ) {
+			$this->set_notice( 'error', $existing->get_error_message() );
+			$this->redirect_to_settings();
+		}
+
+		$header = Order_Mapper::header();
+
+		// Already correct — nothing to do.
+		if ( $this->header_matches( $existing, $header ) ) {
+			$this->set_notice( 'success', __( 'The header row is already up to date.', 'woo-to-gsheet' ) );
+			$this->redirect_to_settings();
+		}
+
+		// Column A always holds the Order ID, so a NUMBER in A1 means row 1 is a
+		// synced order rather than a header. Text means it is a header we may replace.
+		if ( isset( $existing[0] ) && is_numeric( trim( (string) $existing[0] ) ) ) {
+			$this->set_notice(
+				'error',
+				__( 'Row 1 of your sheet contains order data, not a header. Insert a blank row above it in Google Sheets, then click Write Header Row again.', 'woo-to-gsheet' )
+			);
+			$this->redirect_to_settings();
+		}
+
+		// Reuses the same bounded write the sync uses; row 1, one row of values.
+		$result = $sheets->update_rows( $spreadsheet_id, $sheet_name, array( 1 ), array( $header ), $token );
+
+		if ( is_wp_error( $result ) ) {
+			$this->set_notice( 'error', $result->get_error_message() );
+		} else {
+			$this->set_notice(
+				'success',
+				sprintf(
+					/* translators: %d: number of column labels written. */
+					__( 'Header row written: %d columns.', 'woo-to-gsheet' ),
+					count( $header )
+				)
+			);
+		}
+
+		$this->redirect_to_settings();
+	}
+
 	/* ---------------------------------------------------------------------- *
 	 * Helpers.
 	 * ---------------------------------------------------------------------- */
+
+	/**
+	 * Is the sheet's row 1 already exactly our header?
+	 *
+	 * Compares trimmed strings. Google trims trailing empty cells, so a shorter
+	 * returned row simply means "not a match" rather than needing special care.
+	 *
+	 * @param array $existing Cells read back from the sheet.
+	 * @param array $header   Labels from Order_Mapper::header().
+	 * @return bool
+	 */
+	private function header_matches( array $existing, array $header ) {
+		if ( count( $existing ) !== count( $header ) ) {
+			return false;
+		}
+
+		foreach ( $header as $i => $label ) {
+			$cell = isset( $existing[ $i ] ) ? trim( (string) $existing[ $i ] ) : '';
+			if ( $cell !== (string) $label ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
 
 	/**
 	 * A read-only spreadsheets.get for just the title — proves auth + ID work.

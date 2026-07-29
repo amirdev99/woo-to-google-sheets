@@ -153,6 +153,52 @@ class Sheets_Client {
 	}
 
 	/**
+	 * Read one whole row back from the sheet.
+	 *
+	 * Used before writing the header row, so we can tell an empty row from an
+	 * existing header from real order data, and refuse to overwrite the last one.
+	 *
+	 * The range is "1:1" rather than "A1:L1" on purpose: it reads the entire row
+	 * without this class needing to know how many columns the mapper produces,
+	 * which keeps Sheets_Client independent of Order_Mapper.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param string $sheet_name     Sheet/tab name.
+	 * @param int    $row_number     1-based row to read.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return array|\WP_Error Cell values left to right; empty array if the row is blank.
+	 */
+	public function read_row( $spreadsheet_id, $sheet_name, $row_number, $access_token ) {
+		$row_number = max( 1, (int) $row_number );
+		$range      = $this->a1_sheet( $sheet_name ) . '!' . $row_number . ':' . $row_number;
+
+		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '/values/' . rawurlencode( $range );
+
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout' => 20,
+				'headers' => array( 'Authorization' => 'Bearer ' . $access_token ),
+			)
+		);
+
+		$error = $this->response_error( $response, 'wtg_read_failed' );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		// Google omits "values" entirely for a blank range — an empty row, not an
+		// error. Same case find_rows_by_order_id() handles.
+		if ( ! isset( $data['values'][0] ) || ! is_array( $data['values'][0] ) ) {
+			return array();
+		}
+
+		return $data['values'][0];
+	}
+
+	/**
 	 * Overwrite a set of existing rows with fresh values.
 	 *
 	 * Writes WHOLE rows rather than just the status cell: it costs the same

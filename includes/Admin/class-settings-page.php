@@ -509,6 +509,14 @@ class Settings_Page {
 				esc_url( OAuth_Controller::test_url() ),
 				esc_html__( 'Test Connection', 'woo-to-gsheet' )
 			);
+			// Writes the column labels into row 1 so the sheet always matches what
+			// the sync sends. Safe to click repeatedly; it refuses if row 1 holds
+			// order data. Only offered once connected, since it calls the API.
+			printf(
+				'<a href="%1$s" class="button button-secondary">%2$s</a> ',
+				esc_url( OAuth_Controller::write_header_url() ),
+				esc_html__( 'Write Header Row', 'woo-to-gsheet' )
+			);
 			printf(
 				'<a href="%1$s" class="button button-link-delete">%2$s</a>',
 				esc_url( OAuth_Controller::disconnect_url() ),
