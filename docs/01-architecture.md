@@ -79,10 +79,12 @@ ever touch an order, and they do it through WooCommerce's own API rather than th
 ### Who talks to whom
 
 - **Depends on:** `WTG\Plugin` (for `CRON_HOOK_NOW`) and `WTG\Queue\Sync_Queue` — see the
-  `use` statements at the top of `class-order-listener.php`. `Order_Mapper` has **no `use`
-  statements at all**; it depends on nothing but WooCommerce itself.
-- **Depended on by:** `Queue\Sync_Processor` uses `WTG\WooCommerce\Order_Mapper`.
-  Nothing anywhere calls `Order_Listener` directly — WordPress calls it via hooks.
+  `use` statements at the top of `class-order-listener.php`. `Order_Mapper` imports
+  `WTG\Settings`, because the user chooses which columns to write on the Fields tab.
+- **Depended on by:** `Queue\Sync_Processor` calls `Order_Mapper::map()`,
+  `Admin\OAuth_Controller` calls `Order_Mapper::header()` for the Write Header Row button,
+  and `Admin\Settings_Page` calls `Order_Mapper::fields()` / `is_locked()` to render the
+  Fields checklist. Nothing calls `Order_Listener` directly — WordPress invokes it via hooks.
 
 Note the direction: `WooCommerce/` → `Queue/` (the listener enqueues), and `Queue/` →
 `WooCommerce/` (the processor maps). That is a two-way dependency between the folders, but
@@ -251,11 +253,15 @@ flowchart LR
     SP --> S
     SQ --> P
     OC --> S
+    OM --> S
     SPG --> S
     SPG --> OC
     SPG --> SQ
+    SPG --> OM
     OCT --> S
     OCT --> OC
+    OCT --> SC
+    OCT --> OM
     QCT --> SQ
     QCT --> SP
     P --> OL
@@ -267,7 +273,12 @@ flowchart LR
 
 Two things to notice:
 
-1. **`Sheets_Client` and `Order_Mapper` are leaves.** Nothing depends on them except
-   `Sync_Processor`, and they depend on nothing. Those are the two easiest files to change.
+1. **`Sheets_Client` is the only true leaf.** It has zero plugin dependencies, which makes it
+   the easiest file in the plugin to change or replace. `Order_Mapper` used to be a leaf too,
+   until the Fields tab made it read `Settings` — that was the deliberate price of letting
+   users choose their columns.
 2. **`Sync_Processor` is the hub.** It is the only class importing from three different
    modules. If a change feels hard, it is usually because it belongs here.
+3. **`Order_Mapper` now has three callers**, not one. `header()` and `fields()` are read by
+   the admin layer as well as by the sync, which is what keeps the sheet's header row, the
+   data rows, and the settings checklist all describing the same columns.

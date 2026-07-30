@@ -156,80 +156,128 @@ See `02-bootstrap-and-core.md` for why this uses `CRON_HOOK_NOW` and not `CRON_H
 
 ## `class-order-mapper.php` — `WTG\WooCommerce\Order_Mapper`
 
-**Purpose.** Convert a `WC_Order` into the rows written to the sheet — **one row per
-product**.
+**Purpose.** Convert a `WC_Order` into the rows written to the sheet, using the columns the
+user selected.
 
-**Depends on:** nothing (no `use` statements).
-**Called by:** `Queue\Sync_Processor::process()` only.
+**Depends on:** `WTG\Settings` — because column selection and custom headings are settings.
+**Called by:** `Queue\Sync_Processor::process()` (`map()`),
+`Admin\OAuth_Controller::handle_write_header()` (`header()`), and
+`Admin\Settings_Page::render_fields_tab()` / `sanitize_fields()` (`fields()`, `is_locked()`).
 **Registers no hooks.**
+
+### The field registry — `fields()`, static
+
+This is the heart of the class. **One array declares every column the plugin can produce**,
+and the header labels, the row values, and the Fields-tab checklist are all derived from it.
+Add a field here once and it appears in all three.
+
+| Key | Default label | `per_item` | `locked` |
+|---|---|---|---|
+| `order_id` | Order ID | no | **yes** |
+| `date` | Date | no | no |
+| `status` | Status | no | no |
+| `customer` | Customer Name | no | no |
+| `email` | Email | no | no |
+| `phone` | Phone | no | no |
+| `product` | Product | **yes** | no |
+| `quantity` | Quantity | **yes** | no |
+| `unit_price` | Unit Price | **yes** | no |
+| `order_total` | Order Total | no | no |
+| `currency` | Currency | no | no |
+| `payment` | Payment Method | no | no |
+
+- **`per_item`** — the value differs between the products of one order. Only three fields do.
+- **`locked`** — cannot be deselected. Only `order_id`, because
+  `Sheets_Client::ORDER_ID_COLUMN` is `'A'` and the update-in-place feature finds an order by
+  searching column A. **A locked field must therefore stay first in the array.**
+
+The array order *is* the column order. Users choose which fields to include and what to call
+them, but never their position.
+
+### Why the values are a `switch`, not closures in the registry
+
+`value_for( $key, $order, $item = null )` resolves a single field. Putting closures in
+`fields()` was the alternative; a switch keeps the registry pure data — easier to read, and
+safe to cache or serialize.
+
+Note `$item = null`: every per-product case returns `''` when there is no item, which is what
+lets one code path serve both row modes without special-casing.
+
+### `selected_keys()` — static, and the most important method to understand
+
+```php
+$all    = array_keys( self::fields() );
+$stored = Settings::get( 'fields', array() );
+
+if ( ! is_array( $stored ) || empty( $stored ) ) {
+    return $all;          // nothing configured = all fields
+}
+
+$keys = array();
+foreach ( $all as $key ) {                    // walk the CANONICAL list
+    if ( in_array( $key, $stored, true ) || self::is_locked( $key ) ) {
+        $keys[] = $key;
+    }
+}
+```
+
+It iterates the **canonical** list and filters by the stored selection — not the other way
+round. That single choice gives four properties with no extra validation:
+
+1. Column order is always canonical, so reordering is impossible by construction.
+2. An unknown or stale key in settings is ignored automatically.
+3. A locked field is always present, whatever settings say.
+4. A field added in a future version simply is not selected on existing installs — **no
+   migration needed.**
+
+And empty means "all", so a site that never opens the Fields tab keeps the original twelve
+columns.
 
 ### `header()` — static
 
-Returns the 12 column names, in order. Used as documentation and for pasting a header row
-into row 1 of the sheet by hand — **the plugin never writes or reads the header row itself.**
+Returns the headings for the selected fields, applying any user override from
+`field_labels`, falling back to the registry's default label.
 
-| Col | Header | Per product? |
-|---|---|---|
-| A | Order ID | repeats |
-| B | Date | repeats |
-| C | Status | repeats |
-| D | Customer Name | repeats |
-| E | Email | repeats |
-| F | Phone | repeats |
-| G | **Product** | **varies** |
-| H | **Quantity** | **varies** |
-| I | **Unit Price** | **varies** |
-| J | Order Total | repeats |
-| K | Currency | repeats |
-| L | Payment Method | repeats |
-
-Only G, H and I change between rows of the same order.
+This feeds the **Write Header Row** button, which is why the sheet's header can never
+disagree with the data written beneath it — both come from here.
 
 ### `map( \WC_Order $order )`
 
-Returns a **2D array** — a list of rows — even for a single product, so callers never
+Returns a **2D array** — a list of rows — even for a single row, so callers never
 special-case the count.
 
-The method builds two fixed halves once, then loops the line items:
-
 ```php
-$common_head = array( id, date, status, name, email, phone );   // A–F
-$common_tail = array( order total, currency, payment method );  // J–L
+$keys  = self::selected_keys();
+$items = self::has_per_item( $keys ) ? $order->get_items() : array();
 
-foreach ( $order->get_items() as $item ) {
-    $rows[] = array_merge(
-        $common_head,
-        array( $item->get_name(), $item->get_quantity(), $order->get_item_total( $item ) ),
-        $common_tail
-    );
+if ( empty( $items ) ) {
+    return array( $this->build_row( $keys, $order, null ) );
+}
+foreach ( $items as $item ) {
+    $rows[] = $this->build_row( $keys, $order, $item );
 }
 ```
 
-**Why repeat the order-level fields on every row?** It is the standard shape for a flat
-export: each row is self-contained, so filtering and pivot tables work in Sheets without
+That one `if ( empty( $items ) )` covers **three** situations at once:
+
+- **One row per order mode** — no per-product field selected, so line items are never even
+  read. Each order becomes a single row.
+- **An order with no line items** — possible for manually created orders. Without this the
+  order would produce zero rows and vanish from the sheet entirely.
+- WooCommerce returning nothing unexpectedly.
+
+**Why repeat the order-level fields on every product row?** It is the standard shape for a
+flat export: each row is self-contained, so filtering and pivot tables work in Sheets without
 lookups.
 
-**Why `$order->get_item_total( $item )` for Unit Price** rather than dividing the line total
-by the quantity? Because it is WooCommerce's own figure for the amount actually paid **per
-unit after any coupon**. Deriving it by division would produce wrong or ugly values on
-discounts and on quantities that do not divide evenly.
+**Why `$order->get_item_total( $item )` for Unit Price** rather than dividing a line total by
+the quantity? It is WooCommerce's own figure for the amount actually paid **per unit after any
+coupon**. Deriving it by division would be wrong on discounts and ugly on quantities that do
+not divide evenly.
 
-Note the consequence for spreadsheet formulas: **column J (Order Total) repeats**, so summing
-it counts a multi-product order once per row. There is no line-total column — `=H2*I2` gives
-it if you want one.
-
-### The empty-order guard
-
-```php
-if ( empty( $rows ) ) {
-    $rows[] = array_merge( $common_head, array( '', '', '' ), $common_tail );
-}
-```
-
-An order with no line items — rare, but possible for manually created orders — would
-otherwise produce **zero** rows and vanish from the sheet entirely. Emitting one row with
-blank product columns means the order is still recorded. The three `''` values must match the
-three per-product columns; if you add a fourth product column, add a fourth `''` here.
+Consequence for spreadsheet formulas: **Order Total repeats on every row of an order**, so
+summing that column counts a multi-product order more than once. There is no line-total
+column — multiply Quantity by Unit Price if you want one.
 
 ### Private helpers
 
@@ -246,5 +294,6 @@ translatable string `Guest` when both are empty.
 
 - It never calls Google. `Order_Listener` finishes in a couple of local queries.
 - It never runs raw SQL — it goes through `Sync_Queue`.
-- `Order_Mapper` never touches the database or the network, which is why it can be tested
-  with a fabricated order object and no WordPress at all.
+- `Order_Mapper` never touches the database directly and never makes a network call. It does
+  now read `Settings` (which reads an option), so it is no longer testable with zero
+  WordPress — but it is still a pure function of *order + settings*, with no side effects.

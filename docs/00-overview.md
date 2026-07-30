@@ -15,6 +15,11 @@ slow, failure-prone work of talking to Google. If an order is already in the she
 rows are **overwritten in place**, so changing an order from `processing` to `completed`
 updates the existing rows instead of adding duplicates.
 
+Which columns are written is configurable on the **Fields** tab, and a **Write Header Row**
+button puts matching labels in row 1 — so the sheet's header, its data, and the settings all
+describe the same columns. Include no per-product field and each order collapses to a single
+row instead of one per product.
+
 ## Full file tree
 
 ```
@@ -156,7 +161,8 @@ these comments are not:
 
 | Location | Says | Reality |
 |---|---|---|
-| `readme.txt` lines 36–40 | Columns A–J, one row per order, a "Products" column | Columns **A–L**, one row **per product** (`Order_Mapper::header()`) |
+| `readme.txt` lines 36–40 | Columns A–J, one row per order, a "Products" column | Up to **12 selectable** columns, one row **per product** (`Order_Mapper::fields()`) |
+| `readme.txt` line 39 | "add a matching header row manually" | The **Write Header Row** button does it |
 | `readme.txt` lines 15, 24 | Only `processing`/`completed` sync | **Every** status syncs except drafts (`Order_Listener::EXCLUDED_STATUSES`) |
 | `readme.txt` line 30 | Rows are appended | Rows are **upserted** (`Sync_Processor::write()`) |
 | `Settings_Page::render_section_intro()` | "You will connect the account in the next phase" | Connecting happens on this same screen |

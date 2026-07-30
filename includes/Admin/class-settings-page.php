@@ -14,6 +14,7 @@ namespace WTG\Admin;
 use WTG\Settings;
 use WTG\Google\OAuth_Client;
 use WTG\Queue\Sync_Queue;
+use WTG\WooCommerce\Order_Mapper;
 
 // Block direct access.
 if ( ! defined( 'ABSPATH' ) ) {
@@ -49,6 +50,17 @@ class Settings_Page {
 	 * ID of the "connection" settings section.
 	 */
 	const CONNECTION_SECTION = 'wtg_connection_section';
+
+	/**
+	 * Hidden input name that tells sanitize() WHICH form was submitted.
+	 *
+	 * Two separate forms (Connection and Fields) post to the same option. An
+	 * unchecked checkbox is simply not submitted, so without this marker, saving
+	 * the Connection tab would look identical to "the user unticked every field"
+	 * and would wipe the column selection. sanitize() only touches the keys
+	 * belonging to the form that was actually submitted.
+	 */
+	const FORM_MARKER = '_form';
 
 	/**
 	 * Register the admin hooks. Called from Plugin::run() (in admin context).
@@ -177,19 +189,30 @@ class Settings_Page {
 		}
 		$output = $existing;
 
-		// Plain text fields.
-		$output['client_id']      = isset( $input['client_id'] ) ? sanitize_text_field( $input['client_id'] ) : '';
-		$output['spreadsheet_id'] = isset( $input['spreadsheet_id'] ) ? sanitize_text_field( $input['spreadsheet_id'] ) : '';
+		// Which form did this come from? Programmatic writes (the OAuth token
+		// saves) carry no marker and fall through BOTH branches, leaving every
+		// user-facing key exactly as stored — which is what we want.
+		$form = isset( $input[ self::FORM_MARKER ] ) ? sanitize_key( $input[ self::FORM_MARKER ] ) : '';
 
-		// Sheet name: fall back to a sensible default if cleared.
-		$sheet = isset( $input['sheet_name'] ) ? sanitize_text_field( $input['sheet_name'] ) : '';
-		$output['sheet_name'] = '' !== $sheet ? $sheet : 'Sheet1';
+		if ( 'connection' === $form ) {
+			// Plain text fields.
+			$output['client_id']      = isset( $input['client_id'] ) ? sanitize_text_field( $input['client_id'] ) : '';
+			$output['spreadsheet_id'] = isset( $input['spreadsheet_id'] ) ? sanitize_text_field( $input['spreadsheet_id'] ) : '';
 
-		// Client Secret: the field renders blank for security, so a blank
-		// submission means "keep the existing secret", not "erase it".
-		$submitted_secret = isset( $input['client_secret'] ) ? trim( $input['client_secret'] ) : '';
-		if ( '' !== $submitted_secret ) {
-			$output['client_secret'] = sanitize_text_field( $submitted_secret );
+			// Sheet name: fall back to a sensible default if cleared.
+			$sheet                = isset( $input['sheet_name'] ) ? sanitize_text_field( $input['sheet_name'] ) : '';
+			$output['sheet_name'] = '' !== $sheet ? $sheet : 'Sheet1';
+
+			// Client Secret: the field renders blank for security, so a blank
+			// submission means "keep the existing secret", not "erase it".
+			$submitted_secret = isset( $input['client_secret'] ) ? trim( $input['client_secret'] ) : '';
+			if ( '' !== $submitted_secret ) {
+				$output['client_secret'] = sanitize_text_field( $submitted_secret );
+			}
+		}
+
+		if ( 'fields' === $form ) {
+			$output = $this->sanitize_fields( $input, $output, $existing );
 		}
 
 		// CRITICAL: register_setting() runs this callback on EVERY update of the
@@ -207,6 +230,66 @@ class Settings_Page {
 
 		// NOTE: redirect_uri is display-only (read-only field), never submitted,
 		// so it is intentionally not stored here — it is always computed live.
+
+		return $output;
+	}
+
+	/**
+	 * Sanitize the Fields tab: which columns to write, and what to call them.
+	 *
+	 * @param array $input    Raw submitted array.
+	 * @param array $output   Output built so far.
+	 * @param array $existing Previously stored settings, for change detection.
+	 * @return array
+	 */
+	private function sanitize_fields( array $input, array $output, array $existing ) {
+		$registry  = Order_Mapper::fields();
+		$submitted = ( isset( $input['fields'] ) && is_array( $input['fields'] ) ) ? $input['fields'] : array();
+
+		// Walk the CANONICAL order and keep what was ticked. This is the same loop
+		// direction Order_Mapper::selected_keys() uses, and it is what makes the
+		// column order impossible to scramble and unknown keys impossible to store.
+		$chosen = array();
+		foreach ( array_keys( $registry ) as $key ) {
+			if ( in_array( $key, $submitted, true ) || Order_Mapper::is_locked( $key ) ) {
+				$chosen[] = $key;
+			}
+		}
+		$output['fields'] = $chosen;
+
+		// Store ONLY labels that differ from the default. That way, if a default
+		// label is improved in a future version, columns the user never renamed
+		// pick up the new wording automatically.
+		$labels = array();
+		if ( isset( $input['field_labels'] ) && is_array( $input['field_labels'] ) ) {
+			foreach ( $registry as $key => $field ) {
+				if ( ! isset( $input['field_labels'][ $key ] ) ) {
+					continue;
+				}
+				$value = sanitize_text_field( $input['field_labels'][ $key ] );
+				if ( '' !== $value && $value !== $field['label'] ) {
+					$labels[ $key ] = $value;
+				}
+			}
+		}
+		$output['field_labels'] = $labels;
+
+		// If the layout actually changed, the sheet no longer matches. Say so
+		// rather than letting the user discover it as misaligned columns.
+		$before = isset( $existing['fields'] ) && is_array( $existing['fields'] ) ? $existing['fields'] : array();
+
+		// add_settings_error() lives in wp-admin/includes/template.php, which is
+		// NOT loaded on every request. sanitize() runs on every write to this
+		// option — including from admin-post.php during the OAuth callback — so
+		// guard it rather than assuming an admin-page context.
+		if ( $before !== $chosen && function_exists( 'add_settings_error' ) ) {
+			add_settings_error(
+				Settings::OPTION_KEY,
+				'wtg_layout_changed',
+				__( 'Column layout changed. Click "Write Header Row" on the Connection tab to update your sheet. Rows already in the sheet still use the old layout.', 'woo-to-gsheet' ),
+				'warning'
+			);
+		}
 
 		return $output;
 	}
@@ -332,7 +415,7 @@ class Settings_Page {
 		// Which tab? Only used to switch what we display (no state change), so a
 		// nonce is unnecessary; sanitize_key keeps it to a safe [a-z0-9_] slug.
 		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'connection';
-		if ( ! in_array( $active_tab, array( 'connection', 'sync_log' ), true ) ) {
+		if ( ! in_array( $active_tab, array( 'connection', 'fields', 'sync_log' ), true ) ) {
 			$active_tab = 'connection';
 		}
 
@@ -346,6 +429,10 @@ class Settings_Page {
 					class="nav-tab <?php echo 'connection' === $active_tab ? 'nav-tab-active' : ''; ?>">
 					<?php esc_html_e( 'Connection', 'woo-to-gsheet' ); ?>
 				</a>
+				<a href="<?php echo esc_url( add_query_arg( 'tab', 'fields', $base_url ) ); ?>"
+					class="nav-tab <?php echo 'fields' === $active_tab ? 'nav-tab-active' : ''; ?>">
+					<?php esc_html_e( 'Fields', 'woo-to-gsheet' ); ?>
+				</a>
 				<a href="<?php echo esc_url( add_query_arg( 'tab', 'sync_log', $base_url ) ); ?>"
 					class="nav-tab <?php echo 'sync_log' === $active_tab ? 'nav-tab-active' : ''; ?>">
 					<?php esc_html_e( 'Sync Log', 'woo-to-gsheet' ); ?>
@@ -355,6 +442,8 @@ class Settings_Page {
 			<?php
 			if ( 'sync_log' === $active_tab ) {
 				$this->render_sync_log_tab();
+			} elseif ( 'fields' === $active_tab ) {
+				$this->render_fields_tab();
 			} else {
 				$this->render_connection_tab();
 			}
@@ -381,6 +470,14 @@ class Settings_Page {
 			// form to our registered group.
 			settings_fields( self::SETTINGS_GROUP );
 
+			// Tells sanitize() this is the Connection form, so it leaves the
+			// column selection alone. See the FORM_MARKER docblock.
+			printf(
+				'<input type="hidden" name="%1$s[%2$s]" value="connection" />',
+				esc_attr( Settings::OPTION_KEY ),
+				esc_attr( self::FORM_MARKER )
+			);
+
 			// Prints the registered section + fields for this page slug.
 			do_settings_sections( self::MENU_SLUG );
 
@@ -388,6 +485,132 @@ class Settings_Page {
 			?>
 		</form>
 		<?php
+	}
+
+	/**
+	 * The Fields tab: choose which columns go to the sheet, and rename them.
+	 *
+	 * Rendered by hand rather than through the Settings API, because the API is
+	 * awkward for a repeating checklist. It still posts to options.php under the
+	 * same registered group, so nonce and capability handling are unchanged.
+	 *
+	 * @return void
+	 */
+	private function render_fields_tab() {
+		settings_errors();
+
+		$registry = Order_Mapper::fields();
+		$selected = Order_Mapper::selected_keys();
+		$labels   = Settings::get( 'field_labels', array() );
+		if ( ! is_array( $labels ) ) {
+			$labels = array();
+		}
+		?>
+		<p><?php esc_html_e( 'Choose which columns are written to your Google Sheet, and what each one is called. Columns always appear in the order listed below.', 'woo-to-gsheet' ); ?></p>
+
+		<form action="options.php" method="post">
+			<?php
+			settings_fields( self::SETTINGS_GROUP );
+			printf(
+				'<input type="hidden" name="%1$s[%2$s]" value="fields" />',
+				esc_attr( Settings::OPTION_KEY ),
+				esc_attr( self::FORM_MARKER )
+			);
+			?>
+
+			<table class="widefat striped" style="max-width:820px;margin-top:1em;">
+				<thead>
+					<tr>
+						<th style="width:90px;"><?php esc_html_e( 'Include', 'woo-to-gsheet' ); ?></th>
+						<th style="width:60px;"><?php esc_html_e( 'Column', 'woo-to-gsheet' ); ?></th>
+						<th><?php esc_html_e( 'Field', 'woo-to-gsheet' ); ?></th>
+						<th><?php esc_html_e( 'Heading in the sheet', 'woo-to-gsheet' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+				<?php
+				// The spreadsheet letter each INCLUDED field will land in. Counted
+				// only over selected fields, so deselecting one shifts the rest up —
+				// exactly what the sheet will look like after saving.
+				$column_index = 0;
+
+				foreach ( $registry as $key => $field ) :
+					$is_on     = in_array( $key, $selected, true );
+					$is_locked = Order_Mapper::is_locked( $key );
+					$letter    = $is_on ? $this->column_letter( $column_index++ ) : '—';
+					$label     = isset( $labels[ $key ] ) ? $labels[ $key ] : $field['label'];
+					?>
+					<tr>
+						<td>
+							<input type="checkbox"
+								id="wtg_field_<?php echo esc_attr( $key ); ?>"
+								name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[fields][]"
+								value="<?php echo esc_attr( $key ); ?>"
+								<?php checked( $is_on ); ?>
+								<?php disabled( $is_locked ); ?> />
+							<?php if ( $is_locked ) : ?>
+								<?php // A disabled checkbox is not submitted, so post it separately. ?>
+								<input type="hidden"
+									name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[fields][]"
+									value="<?php echo esc_attr( $key ); ?>" />
+							<?php endif; ?>
+						</td>
+						<td><code><?php echo esc_html( $letter ); ?></code></td>
+						<td>
+							<label for="wtg_field_<?php echo esc_attr( $key ); ?>">
+								<?php echo esc_html( $field['label'] ); ?>
+							</label>
+							<?php if ( ! empty( $field['per_item'] ) ) : ?>
+								<span class="description"> &mdash; <?php esc_html_e( 'per product', 'woo-to-gsheet' ); ?></span>
+							<?php endif; ?>
+							<?php if ( $is_locked ) : ?>
+								<span class="description"> &mdash; <?php esc_html_e( 'required', 'woo-to-gsheet' ); ?></span>
+							<?php endif; ?>
+						</td>
+						<td>
+							<input type="text"
+								name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[field_labels][<?php echo esc_attr( $key ); ?>]"
+								value="<?php echo esc_attr( $label ); ?>"
+								class="regular-text"
+								placeholder="<?php echo esc_attr( $field['label'] ); ?>" />
+						</td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+
+			<p class="description" style="margin-top:1em;max-width:820px;">
+				<strong><?php esc_html_e( 'Order ID is required.', 'woo-to-gsheet' ); ?></strong>
+				<?php esc_html_e( 'The plugin finds an order in your sheet by looking up its ID in column A, which is how a status change updates the existing rows instead of adding duplicates.', 'woo-to-gsheet' ); ?>
+			</p>
+			<p class="description" style="max-width:820px;">
+				<?php esc_html_e( 'Product, Quantity and Unit Price are the only fields that differ between the products in one order. If you include none of them, each order is written as a single row instead of one row per product.', 'woo-to-gsheet' ); ?>
+			</p>
+			<p class="description" style="max-width:820px;">
+				<?php esc_html_e( 'After changing this, click "Write Header Row" on the Connection tab. Rows already in your sheet keep the old layout.', 'woo-to-gsheet' ); ?>
+			</p>
+
+			<?php submit_button(); ?>
+		</form>
+		<?php
+	}
+
+	/**
+	 * 0 => A, 25 => Z, 26 => AA. Used to preview which column each field lands in.
+	 *
+	 * @param int $index 0-based column index.
+	 * @return string
+	 */
+	private function column_letter( $index ) {
+		$index  = max( 0, (int) $index );
+		$letter = '';
+
+		do {
+			$letter = chr( 65 + ( $index % 26 ) ) . $letter;
+			$index  = intdiv( $index, 26 ) - 1;
+		} while ( $index >= 0 );
+
+		return $letter;
 	}
 
 	/**

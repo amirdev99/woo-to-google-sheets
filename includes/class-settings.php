@@ -53,6 +53,16 @@ class Settings {
 
 			// --- Connection health -------------------------------------------
 			'reauth_needed'  => false, // True when a refresh failed and the user must reconnect.
+
+			// --- Column selection (Fields tab) --------------------------------
+			// Ordered list of Order_Mapper field keys to write. An EMPTY array
+			// means "all fields", so a site that never opens the Fields tab keeps
+			// the original twelve columns and needs no migration.
+			'fields'         => array(),
+			// Per-field column heading overrides, keyed by field key. Only values
+			// that differ from the default are stored, so if a default label is
+			// improved in a later version, non-overridden columns follow it.
+			'field_labels'   => array(),
 		);
 	}
 

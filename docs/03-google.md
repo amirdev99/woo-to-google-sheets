@@ -181,12 +181,12 @@ into `token_expires` (an absolute timestamp, easier to compare later), and write
 
 ## `class-sheets-client.php` — `WTG\Google\Sheets_Client`
 
-**Purpose.** Three operations against the Sheets API v4 `values` endpoints, which together
-let the processor "upsert": append new rows, find an order's existing rows, overwrite rows
-in place.
+**Purpose.** Four operations against the Sheets API v4 `values` endpoints. Three of them let
+the processor "upsert" — append new rows, find an order's existing rows, overwrite rows in
+place — and the fourth reads a row back, which the Write Header Row button needs.
 
 **Depends on:** nothing. **Zero `use` statements** — the most isolated class in the plugin.
-**Called by:** `Queue\Sync_Processor` only.
+**Called by:** `Queue\Sync_Processor`, and `Admin\OAuth_Controller` for the header button.
 
 ### Constants
 
@@ -233,6 +233,20 @@ Three behaviours worth knowing:
    the API may hand back `"14670"` or `14670` depending on how the cell was entered.
 
 Returns an ascending list of **1-based** row numbers (`$index + 1`).
+
+### `read_row( $spreadsheet_id, $sheet_name, $row_number, $access_token )`
+
+`GET {API_BASE}{id}/values/{sheet}!1:1`
+
+Reads one whole row back. Used by the **Write Header Row** button, which must tell an empty
+row from an existing header from real order data before it writes anything.
+
+The range is `1:1` rather than `A1:L1` deliberately — it reads the entire row without this
+class needing to know how many columns `Order_Mapper` produces, which keeps `Sheets_Client`
+independent of the mapper.
+
+Returns the cell values left to right, or an empty array when the row is blank (Google omits
+`values` entirely for an empty range — the same case `find_rows_by_order_id()` handles).
 
 ### `update_rows( $spreadsheet_id, $sheet_name, array $row_numbers, array $rows, $access_token )`
 
@@ -311,6 +325,7 @@ apostrophe is A1 notation's own escaping rule.
 | `wtg_bad_token_response` | `parse_token_response()` | Non-JSON reply from Google |
 | `wtg_append_failed` | `append_rows()` | Non-2xx from `values:append` |
 | `wtg_lookup_failed` | `find_rows_by_order_id()` | Non-2xx from the column read |
+| `wtg_read_failed` | `read_row()` | Non-2xx when reading a row back |
 | `wtg_update_failed` | `update_rows()` | Non-2xx from `values:batchUpdate`, or count mismatch |
 | `wtg_encode_failed` | `encode()` | Order data is not valid UTF-8 |
 

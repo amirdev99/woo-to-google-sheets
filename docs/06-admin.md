@@ -44,7 +44,11 @@ namespace.
 | `MENU_SLUG` | `woo-to-google-sheets` | The `?page=` value |
 | `MENU_POSITION` | `56` | Sits just below WooCommerce (55.x) |
 | `SETTINGS_GROUP` | `wtg_settings_group` | Must match between `register_setting()` and `settings_fields()` |
-| `CONNECTION_SECTION` | `wtg_connection_section` | The one settings section |
+| `CONNECTION_SECTION` | `wtg_connection_section` | The Settings-API section on the Connection tab |
+| `FORM_MARKER` | `_form` | Hidden input telling `sanitize()` which form was submitted |
+
+There are **three tabs**: `connection`, `fields`, `sync_log`. `render_page()` validates
+`$_GET['tab']` against exactly that list.
 
 ### Hooks registered
 
@@ -122,6 +126,43 @@ the refresh token would be silently stripped before it was ever saved.**
 
 `redirect_uri` is intentionally not stored — it is display-only and always computed live.
 
+### The form marker — why `sanitize()` branches
+
+Two forms now write this option: the Connection tab and the Fields tab. An unchecked checkbox
+is **not submitted at all**, so saving the Connection tab looks exactly like "the user
+unticked every field" — and would wipe the column selection.
+
+Each form therefore posts a hidden `wtg_settings[_form]`, and `sanitize()` only rewrites the
+keys belonging to that form:
+
+```php
+$form = isset( $input[ self::FORM_MARKER ] ) ? sanitize_key( $input[ self::FORM_MARKER ] ) : '';
+
+if ( 'connection' === $form ) { /* client_id, client_secret, spreadsheet_id, sheet_name */ }
+if ( 'fields' === $form )     { $output = $this->sanitize_fields( $input, $output, $existing ); }
+```
+
+Programmatic token writes carry no marker, so they fall through **both** branches and leave
+every user-facing key exactly as stored — which is the safest possible behaviour. The marker
+itself is never copied into `$output`, so it is never persisted.
+
+### `sanitize_fields( $input, $output, $existing )` — private
+
+Handles the Fields tab. Three things worth noting:
+
+1. It walks the **canonical** registry order and keeps what was ticked — the same loop
+   direction as `Order_Mapper::selected_keys()`, which is what makes scrambled column order
+   and unknown stored keys impossible.
+2. Locked fields (`order_id`) are forced in regardless of what was submitted.
+3. It stores **only labels that differ from the default**, so improved default wording in a
+   future version reaches columns the user never renamed.
+
+If the selection actually changed it raises an `add_settings_error()` warning telling the user
+to click Write Header Row, and that rows already in the sheet keep the old layout. That call is
+guarded with `function_exists()` — `add_settings_error()` lives in
+`wp-admin/includes/template.php`, which is not loaded on every request, and `sanitize()` can
+run from any context including the OAuth callback on `admin-post.php`.
+
 ### Field renderers
 
 | Method | Renders |
@@ -180,13 +221,36 @@ the visible ones.
 ⚠️ The empty-state message still says orders appear "once they reach processing or
 completed", which is out of date — every non-draft status now syncs.
 
+### `render_fields_tab()` — private
+
+Rendered **by hand**, not through the Settings API, because the API is awkward for a repeating
+checklist. It still posts to `options.php` under the same registered group, so nonce and
+capability handling are unchanged.
+
+One row per registry field, showing:
+
+- an **Include** checkbox (`wtg_settings[fields][]`, value = field key)
+- the **column letter** the field will land in — recomputed over *selected* fields only, so
+  deselecting one visibly shifts the rest up, previewing what the sheet will look like
+- the field's default name, tagged "per product" or "required" where applicable
+- an editable **heading** (`wtg_settings[field_labels][<key>]`)
+
+`order_id`'s checkbox is rendered `disabled` **and** accompanied by a hidden input with the
+same name — a disabled checkbox is not submitted, so without the hidden input the locked field
+would appear unticked on every save. (`sanitize_fields()` forces it in anyway; the hidden input
+means the two layers agree.)
+
+`column_letter()` is a small private helper duplicating the same 0→A, 25→Z, 26→AA logic as
+`Sheets_Client::column_letter()`. Duplicated rather than shared because the admin layer should
+not reach into the Google client for a formatting detail.
+
 ### `render_connection_status()` — private
 
 Decides which buttons to show, based on `OAuth_Client` state only:
 
 | State | Shown |
 |---|---|
-| `is_connected()` | Green "Connected", **Test Connection**, **Disconnect** |
+| `is_connected()` | Green "Connected", **Test Connection**, **Write Header Row**, **Disconnect** |
 | `has_credentials()` but not connected | Red "Not connected", **Connect Google Account** |
 | Neither | Red "Not connected" plus instructions to save credentials first |
 
@@ -209,6 +273,7 @@ notices.
 | `ACTION_CONNECT` | `wtg_oauth_connect` |
 | `ACTION_DISCONNECT` | `wtg_oauth_disconnect` |
 | `ACTION_TEST` | `wtg_test_connection` |
+| `ACTION_WRITE_HEADER` | `wtg_write_header` |
 | `STATE_ACTION` | `wtg_oauth_state` |
 | `SHEETS_API` | `https://sheets.googleapis.com/v4/spreadsheets/` |
 
@@ -223,6 +288,7 @@ URL shown on screen and the hook listened to come from the same constant.
 | `admin_post_wtg_oauth_callback` | `handle_callback()` |
 | `admin_post_wtg_oauth_disconnect` | `handle_disconnect()` |
 | `admin_post_wtg_test_connection` | `handle_test()` |
+| `admin_post_wtg_write_header` | `handle_write_header()` |
 | `admin_notices` | `render_notice()` |
 | `admin_notices` | `render_reauth_notice()` |
 
@@ -264,6 +330,31 @@ Proves the whole chain end to end: `get_valid_access_token()` (refreshing transp
 then a check that `spreadsheet_id` is set, then `fetch_spreadsheet_title()`. On success the
 notice names the actual spreadsheet — strong confirmation that the token, the ID and the
 permissions all work.
+
+### `handle_write_header()`
+
+Writes the column labels into row 1. The labels come from `Order_Mapper::header()` — the same
+source the sync uses for data rows — so the header can never disagree with what sits beneath it.
+
+Row 1 may already hold something, so it reads it first via `Sheets_Client::read_row()` and
+branches four ways:
+
+| Row 1 holds | Action |
+|---|---|
+| Nothing | Write the header |
+| Exactly this header | Do nothing, report success — clicking twice is safe |
+| A different or older header | Overwrite it |
+| **Order data** | **Refuse**, and tell the user to insert a blank row first |
+
+It tells order data from a header by checking whether **A1 is numeric**. Column A is always
+Order ID, so a number means a synced order and text means a header. Refusing there matches how
+`Sync_Processor::write()` refuses rather than deleting rows.
+
+The write itself reuses `Sheets_Client::update_rows()` with row number `1` — no new write path
+exists for the header.
+
+`header_matches()` is the private helper comparing trimmed strings; a differing cell count is
+simply "not a match", which handles Google trimming trailing empty cells.
 
 ### `fetch_spreadsheet_title( $token, $spreadsheet_id )` — private
 

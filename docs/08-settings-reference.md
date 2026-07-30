@@ -50,6 +50,25 @@ returns early and rows stay `pending`.
 so the processor always has a target. Passed through `Sheets_Client::a1_sheet()`, which quotes
 it — so tab names with spaces work.
 
+### Column selection (the Fields tab)
+
+| Key | Default | Type | Written by | Read by |
+|---|---|---|---|---|
+| `fields` | `array()` | array of field keys | `Settings_Page::sanitize_fields()` | `Order_Mapper::selected_keys()` |
+| `field_labels` | `array()` | key => label map | `Settings_Page::sanitize_fields()` | `Order_Mapper::header()` |
+
+**`fields`** — an ordered list of `Order_Mapper::fields()` keys. **An empty array means "all
+fields"**, which is why a site that never opens the Fields tab keeps the original twelve
+columns with no migration. `order_id` is always forced in, because
+`Sheets_Client::ORDER_ID_COLUMN` is `'A'` and the update-in-place lookup depends on it.
+
+The stored order is irrelevant — `selected_keys()` walks the canonical registry and filters by
+this list, so a scrambled or stale value cannot produce scrambled columns.
+
+**`field_labels`** — only labels that **differ from the default** are stored. If a default
+label is improved in a future version, columns the user never renamed pick up the new wording
+automatically.
+
 ### Written only by the OAuth flow
 
 These four have **no form fields**. They are written exclusively by `OAuth_Client`.
@@ -93,6 +112,26 @@ foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_neede
 
 **If you add a new non-form setting written programmatically, you must add its key here**, or
 it will be silently stripped every time it is saved.
+
+### ⚠️ The form marker
+
+There are **two** forms writing this option — the Connection tab and the Fields tab — and an
+unchecked checkbox is simply not submitted. Without a way to tell the forms apart, saving the
+Connection tab would be indistinguishable from "the user unticked every field", and would wipe
+the column selection.
+
+So each form posts a hidden `wtg_settings[_form]` value (`Settings_Page::FORM_MARKER`), and
+`sanitize()` only touches the keys belonging to the form that was submitted:
+
+| `_form` value | What `sanitize()` rewrites |
+|---|---|
+| `connection` | `client_id`, `client_secret`, `spreadsheet_id`, `sheet_name` |
+| `fields` | `fields`, `field_labels` |
+| absent — programmatic token writes | nothing user-facing; only the passthrough loop above runs |
+
+`_form` is never copied into `$output`, so it is never persisted.
+
+**If you add a third form, give it its own marker value and its own branch in `sanitize()`.**
 
 ### Not stored: `redirect_uri`
 
