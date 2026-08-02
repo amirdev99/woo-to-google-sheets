@@ -190,8 +190,41 @@ any instance exists.
 
 **Hook:** `register_activation_hook` → `Activator::activate()`.
 
-### `activate()`
-Calls `create_table()` then `schedule_cron()`.
+### `activate()` / `install()` / `maybe_install()`
+
+`activate()` (the activation hook) just calls `install()`, which runs `create_table()` and
+`schedule_cron()`. Both are safe to re-run: `dbDelta` only issues what is needed, and
+`schedule_cron()` is guarded by `wp_next_scheduled()`.
+
+**`maybe_install()` is the important one.** It is hooked on `admin_init` from `Plugin::run()`
+and repairs a broken install on an ordinary admin request:
+
+```php
+if ( get_option( self::DB_VERSION_OPTION ) === self::DB_VERSION && self::table_exists() ) {
+    return;
+}
+self::install();
+```
+
+The activation hook runs **only** when someone clicks Activate — never when the plugin's files
+are replaced over FTP, which is how this plugin actually gets deployed. If the table is missing
+for any reason, every `Sync_Queue::enqueue()` fails silently (`$wpdb->insert()` into a missing
+table returns `false` and nothing surfaces), and orders simply never appear in the Sync Log.
+
+The version option is autoloaded, so the healthy path costs no query beyond the `SHOW TABLES`
+check.
+
+### `DB_VERSION` — separate from `WTG_VERSION`
+
+`DB_VERSION` (currently `1.0.0`) tracks the **schema**, not the plugin. Bump it only when the
+table definition changes. Tying it to the plugin version would re-run `dbDelta` on every
+release for nothing, and would give no way to signal a schema change within a release.
+
+`wtg_db_version` therefore stores `1.0.0`, not the plugin's `0.1.0`.
+
+### `table_exists()`
+A `SHOW TABLES LIKE` check. Worth having as its own method because a missing table is
+invisible everywhere else in the plugin.
 
 ### `create_table()` (private)
 
@@ -206,7 +239,8 @@ Builds a `CREATE TABLE` statement and runs it through `dbDelta()`. Three details
 3. `require_once ABSPATH . 'wp-admin/includes/upgrade.php'` — `dbDelta()` lives in an
    admin-only file that is not loaded on normal requests.
 
-Finally: `update_option( self::DB_VERSION_OPTION, WTG_VERSION )` records `wtg_db_version`.
+Finally: `update_option( self::DB_VERSION_OPTION, self::DB_VERSION )` records `wtg_db_version`,
+which is what `maybe_install()` compares against later.
 
 Full schema in `07-database-schema.md`.
 
@@ -220,11 +254,10 @@ if ( ! wp_next_scheduled( Plugin::CRON_HOOK ) ) {
 
 The guard means re-activating does not stack duplicate events.
 
-> **Known gap.** `activate()` only runs when someone clicks Activate. It does **not** run
-> when plugin files are overwritten over FTP. If the table is missing for any reason, every
-> `Sync_Queue::enqueue()` fails silently — `$wpdb->insert()` into a non-existent table just
-> returns `false` — and nothing appears in the Sync Log. See
-> `10-extending-the-plugin.md` for the self-healing check that would close this.
+> **Previously a known gap, now closed.** An FTP file replacement never fires the activation
+> hook, so a missing table used to mean silent enqueue failures forever.
+> `maybe_install()` on `admin_init` now repairs it. Verified by dropping the table and
+> confirming it was recreated and `enqueue()` worked again.
 
 ---
 

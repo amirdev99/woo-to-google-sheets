@@ -30,13 +30,79 @@ class Activator {
 	const DB_VERSION_OPTION = 'wtg_db_version';
 
 	/**
+	 * The SCHEMA version — deliberately separate from WTG_VERSION.
+	 *
+	 * Bump this only when the table definition below changes. Tying it to the
+	 * plugin version instead would re-run dbDelta on every release for no reason,
+	 * and would give no way to signal a schema change within one release.
+	 *
+	 * 1.0.0 — initial table.
+	 */
+	const DB_VERSION = '1.0.0';
+
+	/**
 	 * Entry point fired by register_activation_hook().
 	 *
 	 * @return void
 	 */
 	public static function activate() {
+		self::install();
+	}
+
+	/**
+	 * Make sure the table exists and the cron is scheduled, on a NORMAL request.
+	 *
+	 * activate() runs only when someone clicks Activate. It does NOT run when the
+	 * plugin's files are replaced over FTP, which is a completely normal way to
+	 * deploy — and it is exactly how this plugin gets updated. If the table is
+	 * missing for any reason (a failed activation, files copied onto a fresh site,
+	 * a restored database), every enqueue fails silently: $wpdb->insert() into a
+	 * table that does not exist returns false, and nothing surfaces anywhere. The
+	 * order simply never appears in the Sync Log.
+	 *
+	 * So we check cheaply on admin requests and repair if needed. The version
+	 * option is autoloaded, so the common case costs no query at all — only a
+	 * version mismatch triggers the SHOW TABLES check and dbDelta.
+	 *
+	 * @return void
+	 */
+	public static function maybe_install() {
+		if ( get_option( self::DB_VERSION_OPTION ) === self::DB_VERSION && self::table_exists() ) {
+			return;
+		}
+
+		self::install();
+	}
+
+	/**
+	 * Create/upgrade the table and schedule the cron. Safe to run repeatedly:
+	 * dbDelta only issues the statements needed to reconcile the schema, and
+	 * schedule_cron() is guarded by wp_next_scheduled().
+	 *
+	 * @return void
+	 */
+	public static function install() {
 		self::create_table();
 		self::schedule_cron();
+	}
+
+	/**
+	 * Does the queue table actually exist right now?
+	 *
+	 * Worth having as its own check because a missing table is invisible
+	 * everywhere else — see maybe_install().
+	 *
+	 * @return bool
+	 */
+	public static function table_exists() {
+		global $wpdb;
+
+		$table = Plugin::table_name();
+
+		// SHOW TABLES LIKE takes the name as a STRING literal, so %s is correct
+		// here — unlike the FROM clauses elsewhere, where a table name cannot be
+		// a placeholder and must be interpolated.
+		return (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table;
 	}
 
 	/**
@@ -92,8 +158,9 @@ class Activator {
 		// only the CREATE/ALTER statements needed to reconcile them.
 		dbDelta( $sql );
 
-		// Record the schema version we just installed, for future migrations.
-		update_option( self::DB_VERSION_OPTION, WTG_VERSION );
+		// Record the SCHEMA version we just installed. maybe_install() compares
+		// against this on later requests to decide whether to re-run dbDelta.
+		update_option( self::DB_VERSION_OPTION, self::DB_VERSION );
 	}
 
 	/**

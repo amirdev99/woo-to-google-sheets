@@ -161,6 +161,12 @@ final class Plugin {
 		// false on the front-end. (Admin\ resolves to WTG\Admin\ because this
 		// class is in the WTG namespace.)
 		if ( is_admin() ) {
+			// Self-heal the table/cron if the plugin's files were updated over FTP
+			// rather than re-activated, which never fires the activation hook.
+			// Admin-only: a broken install should be repaired by an admin visiting
+			// wp-admin, not by a front-end visitor's request.
+			add_action( 'admin_init', array( 'WTG\\Activator', 'maybe_install' ) );
+
 			( new Admin\Settings_Page() )->hooks();
 			// Connect/callback/disconnect/test admin-post actions + their notices.
 			( new Admin\OAuth_Controller() )->hooks();

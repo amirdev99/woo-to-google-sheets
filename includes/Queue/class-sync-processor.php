@@ -78,8 +78,10 @@ class Sync_Processor {
 			// Claim the row and count this attempt up front, so a fatal mid-loop
 			// cannot leave it stuck "pending" with an uncounted try.
 			Sync_Queue::mark( $row->id, Sync_Queue::STATUS_PROCESSING );
-			Sync_Queue::bump_attempts( $row->id );
-			$attempts = (int) $row->attempts + 1;
+			// Use the count the database reports back, not $row->attempts + 1 —
+			// $row was read before the increment, so a concurrent run would make
+			// both callers think they were on the same attempt.
+			$attempts = Sync_Queue::bump_attempts( $row->id );
 
 			// The order may have been deleted since it was queued.
 			$order = function_exists( 'wc_get_order' ) ? wc_get_order( $row->order_id ) : false;

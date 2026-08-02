@@ -622,10 +622,12 @@ class Settings_Page {
 		settings_errors();
 
 		// Status summary + manual trigger.
-		$pending    = Sync_Queue::count_by_status( Sync_Queue::STATUS_PENDING );
-		$processing = Sync_Queue::count_by_status( Sync_Queue::STATUS_PROCESSING );
-		$success    = Sync_Queue::count_by_status( Sync_Queue::STATUS_SUCCESS );
-		$failed     = Sync_Queue::count_by_status( Sync_Queue::STATUS_FAILED );
+		// One query for all four counts.
+		$counts     = Sync_Queue::count_by_status();
+		$pending    = $counts[ Sync_Queue::STATUS_PENDING ];
+		$processing = $counts[ Sync_Queue::STATUS_PROCESSING ];
+		$success    = $counts[ Sync_Queue::STATUS_SUCCESS ];
+		$failed     = $counts[ Sync_Queue::STATUS_FAILED ];
 
 		echo '<p style="margin:1em 0;">';
 		printf(

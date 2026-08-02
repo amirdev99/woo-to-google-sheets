@@ -116,25 +116,54 @@ $wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE status IN ( {$placehol
 does *not* depend on this table — `Sheets_Client::find_rows_by_order_id()` asks the sheet
 itself. A cleared order that is later re-queued still updates its existing rows.
 
-### `count_by_status( $status )`
-`SELECT COUNT(*)`. Drives the four counters at the top of the Sync Log tab.
+### `count_by_status()`
 
-### `get_pending_batch( $limit )`
+One `GROUP BY` query returning **all four** statuses, with zeroes present rather than missing,
+so callers can index the result without guarding. It previously took a status argument and was
+called four times — four queries to draw one line of the Sync Log.
+
+An unrecognised status (from a hand-edited row) is ignored rather than added, so the returned
+array always has exactly the four expected keys.
+
+### `RETRY_BACKOFF` and `get_pending_batch( $limit )`
 
 ```sql
-SELECT id, order_id, attempts FROM … WHERE status = 'pending' ORDER BY id ASC LIMIT %d
+SELECT id, order_id, attempts FROM …
+ WHERE status = 'pending'
+   AND ( attempts = 0 OR TIMESTAMPDIFF( SECOND, updated_at, %s ) >= attempts * 300 )
+ ORDER BY created_at ASC, id ASC
+ LIMIT %d
 ```
 
-`ORDER BY id ASC` means oldest first — fair, and predictable. Only the three columns the
-processor needs are selected.
+**Failed rows now wait longer each time.** With the five-minute cron, retries land at roughly
+5, 10, 15 and 20 minutes. Without the backoff a failing row was retried on *every* run, so a
+sheet temporarily rejecting writes would burn all five attempts in about twenty-five minutes
+and park the order as `failed`.
+
+`attempts = 0` covers everything fresh — a new order, a requeue after a status change, and a
+manual Retry all reset attempts — so **nothing legitimate is ever delayed**. Only genuine
+retries back off.
+
+`TIMESTAMPDIFF` is used rather than `DATE_SUB` with an `INTERVAL` expression because it takes
+the column on the left and needs no interval-unit arithmetic, which keeps it portable across
+MySQL and MariaDB.
+
+`ORDER BY created_at ASC, id ASC` drains a backlog in arrival order, with `id` as a stable
+tiebreaker.
 
 ### `mark( $id, $status, $error = '' )`
 Sets `status`, `last_error` and `updated_at` together. Stores `''` rather than `NULL` for
 `last_error` to keep `$wpdb->update()` simple and consistent across MySQL configurations.
 
 ### `bump_attempts( $id )`
-A raw `UPDATE … SET attempts = attempts + 1`. Written as a query rather than a read-modify-
-write so the increment happens atomically in the database.
+
+`UPDATE … SET attempts = attempts + 1` so the increment is atomic, then **reads the new value
+back and returns it**.
+
+The read-back matters: the processor's `$row` was loaded *before* the increment, so
+`$row->attempts + 1` would be stale if two runs ever overlapped — and both would then believe
+they were on the same attempt, giving the row more retries than `MAX_ATTEMPTS` allows.
+`Sync_Processor` uses the returned value.
 
 ### `reset_for_retry( $id )`
 Sets a row back to `pending` with `attempts = 0` and no error. Backs the per-row **Retry**
@@ -187,13 +216,13 @@ untouched. One token is fetched once and reused for the whole batch.
 
 ```php
 Sync_Queue::mark( $row->id, Sync_Queue::STATUS_PROCESSING );
-Sync_Queue::bump_attempts( $row->id );
-$attempts = (int) $row->attempts + 1;
+$attempts = Sync_Queue::bump_attempts( $row->id );
 ```
 
 Marking `processing` and counting the attempt **up front** means a fatal error mid-loop
 cannot leave the row stuck as `pending` with an uncounted try — which would retry forever.
-`$attempts` is computed in PHP because `$row` was read before the increment.
+`$attempts` comes from the value the database reports back, not from `$row->attempts + 1`,
+which would be stale under concurrent runs.
 
 **2. The order may have been deleted.**
 

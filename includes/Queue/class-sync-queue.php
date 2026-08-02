@@ -196,26 +196,63 @@ class Sync_Queue {
 	}
 
 	/**
-	 * Count rows in a given status (used by the admin Sync Log later).
+	 * Row counts for every status, in ONE query.
 	 *
-	 * @param string $status One of the STATUS_* constants.
-	 * @return int
+	 * Returns all four keys even when a status has no rows, so callers can index
+	 * the result without guarding. Previously this took a status and ran once per
+	 * status, which meant four queries to draw one line of the Sync Log.
+	 *
+	 * @return array<string,int> status => count
 	 */
-	public static function count_by_status( $status ) {
+	public static function count_by_status() {
 		global $wpdb;
 
 		$table = self::table();
 
-		return (int) $wpdb->get_var(
-			$wpdb->prepare(
-				"SELECT COUNT(*) FROM {$table} WHERE status = %s",
-				$status
-			)
+		$counts = array(
+			self::STATUS_PENDING    => 0,
+			self::STATUS_PROCESSING => 0,
+			self::STATUS_SUCCESS    => 0,
+			self::STATUS_FAILED     => 0,
 		);
+
+		$rows = $wpdb->get_results( "SELECT status, COUNT(*) AS total FROM {$table} GROUP BY status" ); // phpcs:ignore WordPress.DB
+
+		if ( is_array( $rows ) ) {
+			foreach ( $rows as $row ) {
+				// An unexpected status (hand-edited row) is ignored rather than
+				// added, so the caller's four keys stay exactly four.
+				if ( array_key_exists( $row->status, $counts ) ) {
+					$counts[ $row->status ] = (int) $row->total;
+				}
+			}
+		}
+
+		return $counts;
 	}
 
 	/**
+	 * Seconds of cool-off added per failed attempt.
+	 *
+	 * With the five-minute cron this spaces retries at roughly 5, 10, 15 and 20
+	 * minutes. Without it, a row that fails keeps being retried on every run, so a
+	 * sheet that is temporarily rejecting writes burns the whole attempt budget in
+	 * about twenty-five minutes and parks the order as failed.
+	 */
+	const RETRY_BACKOFF = 300;
+
+	/**
 	 * Fetch a batch of pending rows for the processor to send.
+	 *
+	 * Oldest first, so a backlog drains in the order it arrived.
+	 *
+	 * Rows that have already failed wait longer each time. `attempts = 0` covers
+	 * everything fresh — a new order, a requeue after a status change, and a manual
+	 * Retry all reset attempts — so none of those are ever delayed.
+	 *
+	 * TIMESTAMPDIFF is used rather than DATE_SUB with an INTERVAL expression
+	 * because it takes the column on the left and needs no interval-unit
+	 * arithmetic, which keeps it portable across MySQL and MariaDB.
 	 *
 	 * @param int $limit Maximum rows to return.
 	 * @return array Row objects with id, order_id, attempts.
@@ -227,8 +264,14 @@ class Sync_Queue {
 
 		return $wpdb->get_results(
 			$wpdb->prepare(
-				"SELECT id, order_id, attempts FROM {$table} WHERE status = %s ORDER BY id ASC LIMIT %d",
+				"SELECT id, order_id, attempts FROM {$table}
+				 WHERE status = %s
+				   AND ( attempts = 0 OR TIMESTAMPDIFF( SECOND, updated_at, %s ) >= attempts * %d )
+				 ORDER BY created_at ASC, id ASC
+				 LIMIT %d",
 				self::STATUS_PENDING,
+				current_time( 'mysql', true ),
+				self::RETRY_BACKOFF,
 				(int) $limit
 			)
 		);
@@ -262,22 +305,32 @@ class Sync_Queue {
 	}
 
 	/**
-	 * Increment a row's attempt counter.
+	 * Increment a row's attempt counter and return the NEW value.
+	 *
+	 * The count is read back from the database rather than computed in PHP. The
+	 * caller's row object was loaded before the increment, so `$row->attempts + 1`
+	 * would be stale if two runs ever overlapped — and both would then believe they
+	 * were on the same attempt, giving the row more retries than MAX_ATTEMPTS allows.
 	 *
 	 * @param int $id Row ID.
-	 * @return void
+	 * @return int The attempt count after incrementing.
 	 */
 	public static function bump_attempts( $id ) {
 		global $wpdb;
 
 		$table = self::table();
+		$id    = (int) $id;
 
 		$wpdb->query(
 			$wpdb->prepare(
 				"UPDATE {$table} SET attempts = attempts + 1, updated_at = %s WHERE id = %d",
 				current_time( 'mysql', true ),
-				(int) $id
+				$id
 			)
+		);
+
+		return (int) $wpdb->get_var(
+			$wpdb->prepare( "SELECT attempts FROM {$table} WHERE id = %d", $id )
 		);
 	}
 

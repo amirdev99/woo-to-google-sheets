@@ -191,6 +191,16 @@ destination.
 
 ## Recommended cleanups
 
+### ✅ Make the install self-healing — DONE
+
+Implemented as `Activator::maybe_install()`, hooked on `admin_init` from `Plugin::run()`, with
+`DB_VERSION` tracking the schema separately from `WTG_VERSION`. Verified by dropping the table
+and confirming it was recreated and `enqueue()` worked again. The original recommendation is
+kept below for reference.
+
+<details>
+<summary>Original recommendation</summary>
+
 ### Make the install self-healing (highest value)
 
 `Activator::activate()` runs **only** when someone clicks Activate — not when files are
@@ -226,6 +236,8 @@ public static function table_exists() {
 from within the class. Hook `maybe_install()` on `admin_init` in `Plugin::run()`.
 
 This also gives `wtg_db_version` its first real reader (see `08-settings-reference.md`).
+
+</details>
 
 ### Surface enqueue failures
 

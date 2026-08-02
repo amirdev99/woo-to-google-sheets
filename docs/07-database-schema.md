@@ -125,10 +125,12 @@ Both live in `wp_options`. Full field-by-field detail in `08-settings-reference.
 | Option | Written by | Read by | Shape |
 |---|---|---|---|
 | `wtg_settings` | `Settings::set()` / `update()`, and `options.php` via `Settings_Page::sanitize()` | `Settings::all()` | Serialized array of 8 keys |
-| `wtg_db_version` | `Activator::create_table()` | *nothing currently* | String, e.g. `0.1.0` |
+| `wtg_db_version` | `Activator::create_table()` | `Activator::maybe_install()` | Schema version string, currently `1.0.0` |
 
-`wtg_db_version` is written but never read. It exists so a future schema change can compare
-it against `WTG_VERSION` and run a migration — see `10-extending-the-plugin.md`.
+`wtg_db_version` holds the **schema** version (`Activator::DB_VERSION`), deliberately separate
+from the plugin's `WTG_VERSION`. `Activator::maybe_install()` compares the two on `admin_init`
+and re-runs `dbDelta` when they differ or the table is missing — which is what makes an
+FTP-deployed update self-healing.
 
 Both are deleted by `uninstall.php`.
 
