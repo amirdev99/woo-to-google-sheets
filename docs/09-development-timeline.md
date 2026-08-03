@@ -219,15 +219,25 @@ to be silently skipped. It now trusts the `$to` argument the hook provides.
   single source of truth.
 - Added **Clear Log** (`Sync_Queue::clear()`), restricted to finished rows only.
 
-### A feature that was built and then removed
+### A feature that was built, reverted, then rebuilt
 
-A spreadsheet-picker dropdown, listing the account's sheets by title via the Google Drive
-API, was implemented in a `Google/class-drive-client.php` and then **reverted at the author's
-request** — pasting the Spreadsheet ID was preferred. The OAuth scope went back to
-`auth/spreadsheets` alone.
+A spreadsheet-picker dropdown, listing the account's sheets by title via the Google Drive API,
+was implemented in `Google/class-drive-client.php` and then **reverted at the author's
+request** — pasting the Spreadsheet ID was preferred at the time.
 
-Nothing of it remains in the codebase. It is recorded here only so that a stray
-`drive.metadata.readonly` grant on an old Google connection has an explanation.
+It was later **rebuilt and extended**, after MetForm Pro was checked as a reference and found
+to do exactly the same thing (`drive/v3/files` with
+`mimeType='application/vnd.google-apps.spreadsheet'`, though requesting full `auth/drive`
+rather than the narrower `drive.metadata.readonly` used here).
+
+The rebuild differs from the first attempt in three ways:
+
+- **Both** lists are dropdowns now — spreadsheets *and* tabs. The tab list needs no extra
+  permission, since `spreadsheets.get` is covered by the existing scope.
+- `Drive_Client` is **pure HTTP with no caching**, matching `Sheets_Client`. The transients
+  moved to `Settings_Page`, so `Google/` stays a plain transport layer.
+- Every failure path **falls back to the original text input**, so a missing permission or an
+  API error can never leave the settings page unusable.
 
 ---
 

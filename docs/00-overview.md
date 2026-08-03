@@ -40,7 +40,8 @@ woo-to-google-sheets/
     │   └── class-queue-controller.php  process-now / retry / clear-log actions
     ├── Google/
     │   ├── class-oauth-client.php    OAuth2 authorization-code flow + token storage
-    │   └── class-sheets-client.php   Sheets API v4: append, find rows, batch update
+    │   ├── class-sheets-client.php   Sheets API v4: append, find, update, read, list tabs
+    │   └── class-drive-client.php    Drive API v3: list the account's spreadsheets
     ├── Queue/
     │   ├── class-sync-queue.php      All SQL against {prefix}wtg_sync_log
     │   └── class-sync-processor.php  The cron callback that actually syncs
@@ -49,8 +50,8 @@ woo-to-google-sheets/
         └── class-order-mapper.php    WC_Order → array of spreadsheet rows
 ```
 
-17 files, ~3,470 lines. There is **no `.git` folder** in this project, so nothing here is
-derived from commit history — see `09-development-timeline.md` for how the build order was
+18 files under `includes/` plus the bootstrap, uninstaller and readme. There is **no `.git`
+folder** in this project, so nothing here is derived from commit history — see `09-development-timeline.md` for how the build order was
 reconstructed instead.
 
 ## Where to start reading

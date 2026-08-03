@@ -1,5 +1,11 @@
 # 03 — `includes/Google/`
 
+> **Three classes now:** `OAuth_Client` (credentials and tokens), `Sheets_Client` (spreadsheet
+> data), and `Drive_Client` (listing the account's spreadsheets). All three are **pure HTTP** —
+> no caching, no options, no WordPress state beyond the HTTP helpers. The transients that back
+> the settings-page dropdowns live in `Admin\Settings_Page`, deliberately, so this folder stays
+> a plain transport layer.
+
 ## Why this folder exists
 
 **Everything that speaks HTTP to Google lives here, and nothing here knows what a
@@ -314,6 +320,50 @@ apostrophe is A1 notation's own escaping rule.
 
 ---
 
+### `list_sheet_titles( $spreadsheet_id, $access_token )`
+
+`GET {API_BASE}{id}?fields=sheets.properties.title`
+
+Returns the tab names inside a spreadsheet, in sheet order. Backs the **Sheets List**
+dropdown.
+
+The `fields` mask matters: without it, `spreadsheets.get` returns the entire document, which
+for a large sheet is an enormous response when all we want is a handful of strings.
+
+**Needs no extra permission.** `auth/spreadsheets` already covers reading a spreadsheet whose
+ID we hold — only the *file listing* below requires Drive.
+
+---
+
+## `class-drive-client.php` — `WTG\Google\Drive_Client`
+
+**Purpose.** List the spreadsheets in the connected Google account, so the settings page can
+offer them by name instead of asking for a raw ID.
+
+**Depends on:** nothing. **Called by:** `Admin\Settings_Page` only — never by the sync.
+
+### `list_spreadsheets( $access_token )`
+
+`GET drive/v3/files`
+
+| Parameter | Value | Why |
+|---|---|---|
+| `q` | `mimeType='application/vnd.google-apps.spreadsheet' and trashed=false` | Spreadsheets only, nothing in the bin |
+| `fields` | `files(id,name)` | A full Drive file record is enormous |
+| `orderBy` | `name` | Alphabetical, so the dropdown is scannable |
+| `pageSize` | `200` | One page is plenty; no pagination loop |
+| `supportsAllDrives` / `includeItemsFromAllDrives` | `true` | Include Shared Drives, not just My Drive |
+
+**Why Drive at all?** The Sheets API cannot list files — it only works with an ID you already
+have. There is no way to build this dropdown without Drive. MetForm Pro solves it the same
+way, requesting full `auth/drive`; this plugin uses `drive.metadata.readonly`, which exposes
+names and IDs but never file contents.
+
+**401 and 403 get their own error code.** They almost always mean the stored token predates
+the Drive scope, which is fixed by reconnecting rather than retrying — so
+`wtg_drive_scope_missing` carries a message saying exactly that, and the settings page renders
+a Disconnect button beside it.
+
 ## Error codes this folder produces
 
 | Code | Raised by | Meaning |
@@ -326,6 +376,9 @@ apostrophe is A1 notation's own escaping rule.
 | `wtg_append_failed` | `append_rows()` | Non-2xx from `values:append` |
 | `wtg_lookup_failed` | `find_rows_by_order_id()` | Non-2xx from the column read |
 | `wtg_read_failed` | `read_row()` | Non-2xx when reading a row back |
+| `wtg_sheet_list_failed` | `list_sheet_titles()` | Non-2xx when listing a spreadsheet's tabs |
+| `wtg_drive_scope_missing` | `Drive_Client::list_spreadsheets()` | 401/403 — token predates the Drive scope; reconnect |
+| `wtg_drive_list_failed` | `Drive_Client::list_spreadsheets()` | Any other non-2xx from Drive |
 | `wtg_update_failed` | `update_rows()` | Non-2xx from `values:batchUpdate`, or count mismatch |
 | `wtg_encode_failed` | `encode()` | Order data is not valid UTF-8 |
 

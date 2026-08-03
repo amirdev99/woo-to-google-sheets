@@ -39,11 +39,33 @@ class OAuth_Client {
 	const REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
 
 	/**
-	 * The scope we request. The read/write Sheets scope — we only READ during
-	 * the Phase 3 Test Connection, but Phase 5 appends rows, so we request the
-	 * write scope now to avoid a second consent later.
+	 * Google's token-introspection endpoint. Tells us what a token was ACTUALLY
+	 * granted, which is the only way to settle "did the reconnect pick up the new
+	 * scope or not" without guessing.
 	 */
-	const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+	const TOKENINFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
+
+	/**
+	 * The scopes we request, space separated (Google's required format).
+	 *
+	 *  - auth/spreadsheets: read/write a spreadsheet we know the ID of. This is
+	 *    what the sync itself uses, and what lists a spreadsheet's tabs.
+	 *
+	 *  - auth/drive.metadata.readonly: permission to LIST the account's
+	 *    spreadsheets, so the settings page can offer them by name instead of
+	 *    making the user paste a raw ID. The Sheets API cannot do this — it only
+	 *    works with an ID you already have — so Drive is unavoidable here.
+	 *
+	 * This is the NARROWEST Drive scope that can list files: it exposes names and
+	 * IDs only, never file contents. (MetForm Pro requests full auth/drive for the
+	 * same feature; this is deliberately tighter.)
+	 *
+	 * IMPORTANT: adding a scope does not upgrade an existing connection. A token
+	 * issued under the old scope keeps the old permissions, and Drive calls will
+	 * fail with 403 until the user disconnects and reconnects once. The settings
+	 * page detects exactly that and explains it.
+	 */
+	const SCOPE = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.metadata.readonly';
 
 	/**
 	 * admin-post.php action Google redirects back to. Single source of truth:
@@ -223,6 +245,38 @@ class OAuth_Client {
 		}
 
 		return Settings::get( 'access_token', '' );
+	}
+
+	/**
+	 * The scopes Google actually granted this token.
+	 *
+	 * Diagnostic only — nothing in the sync path depends on it. It exists because
+	 * "I reconnected but Drive still fails" has several possible causes, and this
+	 * is the one call that distinguishes them: if the Drive scope is listed here,
+	 * the consent worked and the problem is elsewhere (usually the Drive API being
+	 * switched off in the Google Cloud project).
+	 *
+	 * @param string $access_token Token to inspect.
+	 * @return array|\WP_Error List of granted scope URLs.
+	 */
+	public function granted_scopes( $access_token ) {
+		$response = wp_remote_get(
+			add_query_arg( 'access_token', rawurlencode( $access_token ), self::TOKENINFO_URL ),
+			array( 'timeout' => 15 )
+		);
+
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		if ( ! is_array( $data ) || empty( $data['scope'] ) ) {
+			return new \WP_Error( 'wtg_tokeninfo_failed', __( 'Google did not report this token\'s permissions.', 'woo-to-gsheet' ) );
+		}
+
+		// tokeninfo returns them space separated, the same format we send.
+		return array_values( array_filter( explode( ' ', (string) $data['scope'] ) ) );
 	}
 
 	/**

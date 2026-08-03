@@ -13,6 +13,8 @@ namespace WTG\Admin;
 
 use WTG\Settings;
 use WTG\Google\OAuth_Client;
+use WTG\Google\Drive_Client;
+use WTG\Google\Sheets_Client;
 use WTG\Queue\Sync_Queue;
 use WTG\WooCommerce\Order_Mapper;
 
@@ -63,6 +65,30 @@ class Settings_Page {
 	const FORM_MARKER = '_form';
 
 	/**
+	 * Query argument (and nonce action) for the "refresh the lists" link.
+	 */
+	const REFRESH_ARG = 'wtg_refresh_lists';
+
+	/**
+	 * Transient holding the account's spreadsheet list.
+	 */
+	const CACHE_SPREADSHEETS = 'wtg_spreadsheet_list';
+
+	/**
+	 * Prefix for the per-spreadsheet tab-title cache.
+	 */
+	const CACHE_SHEETS_PREFIX = 'wtg_sheet_titles_';
+
+	/**
+	 * How long a fetched list stays fresh (10 minutes).
+	 *
+	 * Long enough that clicking around the settings page costs no API calls,
+	 * short enough that a newly created sheet appears soon. The refresh link
+	 * clears both caches on demand.
+	 */
+	const CACHE_TTL = 600;
+
+	/**
 	 * Register the admin hooks. Called from Plugin::run() (in admin context).
 	 *
 	 * @return void
@@ -72,6 +98,8 @@ class Settings_Page {
 		// and its fields. Both only ever fire inside wp-admin.
 		add_action( 'admin_menu', array( $this, 'add_menu' ) );
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
+		// Must run before any output, so admin_init rather than during render.
+		add_action( 'admin_init', array( $this, 'maybe_refresh_lists' ) );
 	}
 
 	/**
@@ -295,6 +323,190 @@ class Settings_Page {
 	}
 
 	/* -------------------------------------------------------------------------
+	 * Google list fetching + caching.
+	 *
+	 * Caching lives HERE rather than in the Google/ clients, so those stay a pure
+	 * transport layer with no WordPress state. See docs/01-architecture.md.
+	 * ---------------------------------------------------------------------- */
+
+	/**
+	 * Access token for this request, fetched at most once.
+	 *
+	 * Both dropdowns need a token. Without memoising, rendering the page could
+	 * trigger two refresh round-trips to Google for the same token.
+	 *
+	 * @var string|\WP_Error|null
+	 */
+	private $token = null;
+
+	/**
+	 * A valid access token, or a WP_Error explaining why not.
+	 *
+	 * @return string|\WP_Error
+	 */
+	private function access_token() {
+		if ( null === $this->token ) {
+			$oauth = new OAuth_Client();
+
+			$this->token = $oauth->is_connected()
+				? $oauth->get_valid_access_token()
+				: new \WP_Error( 'wtg_not_connected', __( 'Connect your Google account to load your spreadsheets.', 'woo-to-gsheet' ) );
+		}
+
+		return $this->token;
+	}
+
+	/**
+	 * The account's spreadsheets, cached.
+	 *
+	 * @return array|\WP_Error
+	 */
+	private function cached_spreadsheets() {
+		$cached = get_transient( self::CACHE_SPREADSHEETS );
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$token = $this->access_token();
+		if ( is_wp_error( $token ) ) {
+			return $token;
+		}
+
+		$list = ( new Drive_Client() )->list_spreadsheets( $token );
+		if ( is_wp_error( $list ) ) {
+			return $list;
+		}
+
+		set_transient( self::CACHE_SPREADSHEETS, $list, self::CACHE_TTL );
+
+		return $list;
+	}
+
+	/**
+	 * A spreadsheet's tab names, cached per spreadsheet.
+	 *
+	 * @param string $spreadsheet_id Spreadsheet to inspect.
+	 * @return array|\WP_Error
+	 */
+	private function cached_sheet_titles( $spreadsheet_id ) {
+		// md5 keeps the transient name within the option-name length limit,
+		// whatever the spreadsheet ID looks like.
+		$key = self::CACHE_SHEETS_PREFIX . md5( $spreadsheet_id );
+
+		$cached = get_transient( $key );
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
+		$token = $this->access_token();
+		if ( is_wp_error( $token ) ) {
+			return $token;
+		}
+
+		$titles = ( new Sheets_Client() )->list_sheet_titles( $spreadsheet_id, $token );
+		if ( is_wp_error( $titles ) ) {
+			return $titles;
+		}
+
+		set_transient( $key, $titles, self::CACHE_TTL );
+
+		return $titles;
+	}
+
+	/**
+	 * Nonced URL that clears both cached lists.
+	 *
+	 * @return string
+	 */
+	public static function refresh_url() {
+		return wp_nonce_url( add_query_arg( self::REFRESH_ARG, '1', self::url( 'connection' ) ), self::REFRESH_ARG );
+	}
+
+	/**
+	 * Handle the refresh link: drop the caches and bounce back to a clean URL, so
+	 * reloading the page does not repeat the action.
+	 *
+	 * @return void
+	 */
+	public function maybe_refresh_lists() {
+		if ( ! isset( $_GET[ self::REFRESH_ARG ] ) ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'manage_options' ) || ! check_admin_referer( self::REFRESH_ARG ) ) {
+			return;
+		}
+
+		delete_transient( self::CACHE_SPREADSHEETS );
+
+		$spreadsheet_id = Settings::get( 'spreadsheet_id', '' );
+		if ( '' !== $spreadsheet_id ) {
+			delete_transient( self::CACHE_SHEETS_PREFIX . md5( $spreadsheet_id ) );
+		}
+
+		wp_safe_redirect( self::url( 'connection' ) );
+		exit;
+	}
+
+	/**
+	 * Print the permissions Google says this connection actually has.
+	 *
+	 * This is the diagnostic that separates the two ways the Drive listing can
+	 * fail. If drive.metadata.readonly appears here, the consent screen did its
+	 * job and reconnecting again will not help — the Drive API is switched off in
+	 * the Google Cloud project. If it does NOT appear, the consent did not grant
+	 * it, and reconnecting is the fix.
+	 *
+	 * @return void
+	 */
+	private function render_granted_scopes() {
+		$token = $this->access_token();
+		if ( is_wp_error( $token ) ) {
+			return;
+		}
+
+		$scopes = ( new OAuth_Client() )->granted_scopes( $token );
+		if ( is_wp_error( $scopes ) || empty( $scopes ) ) {
+			return;
+		}
+
+		$has_drive = false;
+		foreach ( $scopes as $scope ) {
+			if ( false !== strpos( $scope, '/auth/drive' ) ) {
+				$has_drive = true;
+				break;
+			}
+		}
+
+		echo '<p class="description"><strong>' . esc_html__( 'Permissions Google reports for this connection:', 'woo-to-gsheet' ) . '</strong><br />';
+		echo esc_html( implode( ', ', $scopes ) ) . '</p>';
+
+		echo '<p class="description">';
+		if ( $has_drive ) {
+			echo '<strong>' . esc_html__( 'A Drive permission IS present', 'woo-to-gsheet' ) . '</strong> &mdash; ';
+			echo esc_html__( 'so reconnecting will not help. Enable the Google Drive API in your Google Cloud project (it is separate from the Sheets API), then click Refresh.', 'woo-to-gsheet' );
+		} else {
+			echo '<strong>' . esc_html__( 'No Drive permission was granted', 'woo-to-gsheet' ) . '</strong> &mdash; ';
+			echo esc_html__( 'add the drive.metadata.readonly scope on your OAuth consent screen, then disconnect and reconnect.', 'woo-to-gsheet' );
+		}
+		echo '</p>';
+	}
+
+	/**
+	 * The "Refresh lists" link, shown next to both dropdowns.
+	 *
+	 * @return void
+	 */
+	private function render_refresh_link() {
+		printf(
+			' <a href="%1$s" class="button button-small" title="%2$s">%3$s</a>',
+			esc_url( self::refresh_url() ),
+			esc_attr__( 'Re-fetch both lists from Google', 'woo-to-gsheet' ),
+			esc_html__( 'Refresh', 'woo-to-gsheet' )
+		);
+	}
+
+	/* -------------------------------------------------------------------------
 	 * Field renderers. Each echoes exactly one input.
 	 * ---------------------------------------------------------------------- */
 
@@ -365,6 +577,76 @@ class Settings_Page {
 	 */
 	public function render_field_spreadsheet_id() {
 		$value = Settings::get( 'spreadsheet_id', '' );
+		$list  = $this->cached_spreadsheets();
+
+		// Anything other than a non-empty list falls back to the text box, so the
+		// page is never a dead end — not connected, missing Drive permission, an
+		// API error, or simply no spreadsheets in the account.
+		if ( is_wp_error( $list ) || empty( $list ) ) {
+			$this->render_spreadsheet_id_input( $value );
+
+			if ( is_wp_error( $list ) ) {
+				echo '<p class="description" style="color:#b32d2e;">' . esc_html( $list->get_error_message() ) . '</p>';
+
+				// A scope problem is only fixed by reconnecting, so offer it here —
+				// but only after showing what the token actually holds, because if
+				// the Drive scope IS present the problem is not the connection.
+				if ( 'wtg_drive_scope_missing' === $list->get_error_code() ) {
+					$this->render_granted_scopes();
+
+					printf(
+						'<p><a class="button" href="%1$s">%2$s</a></p>',
+						esc_url( OAuth_Controller::disconnect_url() ),
+						esc_html__( 'Disconnect so you can reconnect', 'woo-to-gsheet' )
+					);
+				}
+			} else {
+				echo '<p class="description">' . esc_html__( 'No spreadsheets found in this Google account. Create one, then click Refresh.', 'woo-to-gsheet' ) . '</p>';
+			}
+
+			return;
+		}
+
+		printf( '<select id="wtg_spreadsheet_id" name="%s[spreadsheet_id]" class="regular-text">', esc_attr( Settings::OPTION_KEY ) );
+		printf( '<option value="">%s</option>', esc_html__( '— Select a spreadsheet —', 'woo-to-gsheet' ) );
+
+		$known = false;
+		foreach ( $list as $file ) {
+			if ( $file['id'] === $value ) {
+				$known = true;
+			}
+			printf(
+				'<option value="%1$s"%2$s>%3$s</option>',
+				esc_attr( $file['id'] ),
+				selected( $file['id'], $value, false ),
+				esc_html( $file['name'] )
+			);
+		}
+
+		// A saved sheet that is not in the list — typically shared by link rather
+		// than owned — is kept as an option so re-saving cannot silently lose it.
+		if ( '' !== $value && ! $known ) {
+			printf(
+				'<option value="%1$s" selected>%2$s</option>',
+				esc_attr( $value ),
+				/* translators: %s: spreadsheet ID. */
+				esc_html( sprintf( __( 'Currently set: %s', 'woo-to-gsheet' ), $value ) )
+			);
+		}
+
+		echo '</select>';
+		$this->render_refresh_link();
+
+		echo '<p class="description">' . esc_html__( 'Spreadsheets in the connected Google account. The list is cached for a few minutes.', 'woo-to-gsheet' ) . '</p>';
+	}
+
+	/**
+	 * The plain Spreadsheet ID text box, used whenever the list is unavailable.
+	 *
+	 * @param string $value Current value.
+	 * @return void
+	 */
+	private function render_spreadsheet_id_input( $value ) {
 		printf(
 			'<input type="text" id="wtg_spreadsheet_id" name="%1$s[spreadsheet_id]" value="%2$s" class="regular-text" autocomplete="off" />',
 			esc_attr( Settings::OPTION_KEY ),
@@ -387,13 +669,75 @@ class Settings_Page {
 	 * @return void
 	 */
 	public function render_field_sheet_name() {
-		$value = Settings::get( 'sheet_name', 'Sheet1' );
+		$value          = Settings::get( 'sheet_name', 'Sheet1' );
+		$spreadsheet_id = Settings::get( 'spreadsheet_id', '' );
+
+		// The tab list can only be fetched for a spreadsheet we already have saved,
+		// so on first setup this is a two-step flow: choose a spreadsheet, Save,
+		// and the tabs appear.
+		if ( '' === $spreadsheet_id ) {
+			$this->render_sheet_name_input( $value );
+			echo '<p class="description">' . esc_html__( 'Choose a spreadsheet above and click Save Changes — the tab list will then load here.', 'woo-to-gsheet' ) . '</p>';
+			return;
+		}
+
+		$titles = $this->cached_sheet_titles( $spreadsheet_id );
+
+		if ( is_wp_error( $titles ) || empty( $titles ) ) {
+			$this->render_sheet_name_input( $value );
+
+			if ( is_wp_error( $titles ) ) {
+				echo '<p class="description" style="color:#b32d2e;">' . esc_html( $titles->get_error_message() ) . '</p>';
+			} else {
+				echo '<p class="description">' . esc_html__( 'No tabs found in that spreadsheet. Check the Spreadsheet ID, then click Refresh.', 'woo-to-gsheet' ) . '</p>';
+			}
+
+			return;
+		}
+
+		printf( '<select id="wtg_sheet_name" name="%s[sheet_name]" class="regular-text">', esc_attr( Settings::OPTION_KEY ) );
+
+		$known = false;
+		foreach ( $titles as $title ) {
+			if ( $title === $value ) {
+				$known = true;
+			}
+			printf(
+				'<option value="%1$s"%2$s>%1$s</option>',
+				esc_attr( $title ),
+				selected( $title, $value, false )
+			);
+		}
+
+		// Keep a saved tab name that no longer exists — renamed or deleted — rather
+		// than silently switching the sync to a different tab on the next save.
+		if ( '' !== $value && ! $known ) {
+			printf(
+				'<option value="%1$s" selected>%2$s</option>',
+				esc_attr( $value ),
+				/* translators: %s: saved tab name that no longer exists. */
+				esc_html( sprintf( __( '%s (not found in this spreadsheet)', 'woo-to-gsheet' ), $value ) )
+			);
+		}
+
+		echo '</select>';
+		$this->render_refresh_link();
+
+		echo '<p class="description">' . esc_html__( 'Tabs in the selected spreadsheet. Rows are written to this tab.', 'woo-to-gsheet' ) . '</p>';
+	}
+
+	/**
+	 * The plain Sheet Name text box, used whenever the tab list is unavailable.
+	 *
+	 * @param string $value Current value.
+	 * @return void
+	 */
+	private function render_sheet_name_input( $value ) {
 		printf(
 			'<input type="text" id="wtg_sheet_name" name="%1$s[sheet_name]" value="%2$s" class="regular-text" />',
 			esc_attr( Settings::OPTION_KEY ),
 			esc_attr( $value )
 		);
-		echo '<p class="description">' . esc_html__( 'The worksheet/tab name rows are appended to (e.g. Sheet1).', 'woo-to-gsheet' ) . '</p>';
 	}
 
 	/* -------------------------------------------------------------------------

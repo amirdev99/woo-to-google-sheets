@@ -153,6 +153,51 @@ class Sheets_Client {
 	}
 
 	/**
+	 * List the tab names inside a spreadsheet.
+	 *
+	 * Uses spreadsheets.get with a `fields` mask so Google returns only the tab
+	 * titles rather than the entire document, which for a large sheet would be a
+	 * very expensive response.
+	 *
+	 * Needs no extra permission: the existing auth/spreadsheets scope already
+	 * covers reading a spreadsheet whose ID we hold. Only the *file listing* on
+	 * the settings page needs Drive.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return array|\WP_Error List of tab title strings, in sheet order.
+	 */
+	public function list_sheet_titles( $spreadsheet_id, $access_token ) {
+		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '?fields=sheets.properties.title';
+
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout' => 20,
+				'headers' => array( 'Authorization' => 'Bearer ' . $access_token ),
+			)
+		);
+
+		$error = $this->response_error( $response, 'wtg_sheet_list_failed' );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+		$titles = array();
+
+		if ( isset( $data['sheets'] ) && is_array( $data['sheets'] ) ) {
+			foreach ( $data['sheets'] as $sheet ) {
+				if ( isset( $sheet['properties']['title'] ) && '' !== $sheet['properties']['title'] ) {
+					$titles[] = (string) $sheet['properties']['title'];
+				}
+			}
+		}
+
+		return $titles;
+	}
+
+	/**
 	 * Read one whole row back from the sheet.
 	 *
 	 * Used before writing the header row, so we can tell an empty row from an

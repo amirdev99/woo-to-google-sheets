@@ -171,8 +171,46 @@ run from any context including the OAuth callback on `admin-post.php`.
 | `render_field_client_id()` | Text input |
 | `render_field_client_secret()` | **Password** input, always `value=""`. Placeholder changes to "•••••••• (leave blank to keep saved secret)" when a secret exists — never echoes the stored secret into the page source |
 | `render_field_redirect_uri()` | Read-only input showing `OAuth_Client::redirect_uri()`, with `onclick="this.select();"` for easy copying. Not part of the saved option |
-| `render_field_spreadsheet_id()` | Text input plus help text |
-| `render_field_sheet_name()` | Text input, defaults to `Sheet1` |
+| `render_field_spreadsheet_id()` | **Dropdown** of the account's spreadsheets by name, with a Refresh button |
+| `render_field_sheet_name()` | **Dropdown** of the selected spreadsheet's tabs, with a Refresh button |
+
+### The two dropdowns
+
+Both replace what used to be text boxes, and both keep the **same input `name`** —
+`wtg_settings[spreadsheet_id]` and `wtg_settings[sheet_name]`. That is why `sanitize()`
+needed no changes at all: a `<select>` posts exactly what an `<input>` did.
+
+**Every failure path falls back to the original text input**, so the page is never a dead end:
+not connected, missing Drive permission, an API error, or an empty account. The fallback keeps
+the same field name, so saving still works normally.
+
+Three details worth knowing:
+
+- **A saved spreadsheet that is not in the list is preserved** as an extra selected option —
+  typically one shared by link rather than owned. Without that, re-saving would silently clear
+  it. The same applies to a tab name that has been renamed or deleted, which is shown as
+  "*(not found in this spreadsheet)*" rather than quietly switching the sync to a different tab.
+- **The tab list needs a saved spreadsheet**, so first-time setup is two steps: choose a
+  spreadsheet → Save → the tab dropdown populates. The field says so explicitly. Avoiding that
+  would need JavaScript, which this plugin does not currently ship.
+- **`wtg_drive_scope_missing` renders a Disconnect button** beside the error, because a missing
+  scope is only fixable by reconnecting.
+
+### Caching — and why it lives here, not in `Google/`
+
+`Settings_Page` owns two transients: `wtg_spreadsheet_list`, and
+`wtg_sheet_titles_{md5(spreadsheet_id)}` per spreadsheet, both for 10 minutes. `md5()` keeps
+the transient name within the option-name length limit whatever the ID looks like.
+
+The Google clients stay pure HTTP with no WordPress state — caching is a display concern, so it
+belongs to the layer doing the displaying.
+
+`access_token()` memoises the token on the instance, because both dropdowns need one and
+without it a single page render could trigger two refresh round-trips to Google.
+
+`maybe_refresh_lists()` (hooked on `admin_init`) handles the Refresh button: verify capability
+and nonce, delete both transients, then `wp_safe_redirect()` to a clean URL so reloading does
+not repeat the action.
 
 The spreadsheet help text is worth noting because it demonstrates a real escaping fix:
 
