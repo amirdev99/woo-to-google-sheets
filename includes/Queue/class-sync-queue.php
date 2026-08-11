@@ -278,6 +278,60 @@ class Sync_Queue {
 	}
 
 	/**
+	 * Is anything waiting to be sent?
+	 *
+	 * Kept separate from count_by_status(), which GROUPs over the whole table.
+	 * This runs on ordinary admin page loads (see Sync_Runner::catch_up), so it
+	 * has to be as close to free as possible: LIMIT 1 against the `status` index,
+	 * stopping at the first hit.
+	 *
+	 * @return bool
+	 */
+	public static function has_pending() {
+		global $wpdb;
+
+		$table = self::table();
+
+		return null !== $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$table} WHERE status = %s LIMIT 1",
+				self::STATUS_PENDING
+			)
+		);
+	}
+
+	/**
+	 * How long has the oldest pending row been waiting?
+	 *
+	 * The signal behind the "sync looks stalled" warning in the admin. A backlog
+	 * is normal for a few seconds; a row that has been pending for many minutes
+	 * means every layer of Sync_Runner failed, which the shop owner needs told
+	 * rather than left to discover from a stale spreadsheet.
+	 *
+	 * Rows that have already failed an attempt are excluded — those are waiting
+	 * on RETRY_BACKOFF by design, not because the automation is broken.
+	 *
+	 * @return int Seconds, or 0 when nothing is waiting.
+	 */
+	public static function oldest_pending_age() {
+		global $wpdb;
+
+		$table = self::table();
+
+		$seconds = $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT TIMESTAMPDIFF( SECOND, MIN( created_at ), %s )
+				 FROM {$table}
+				 WHERE status = %s AND attempts = 0",
+				current_time( 'mysql', true ),
+				self::STATUS_PENDING
+			)
+		);
+
+		return max( 0, (int) $seconds );
+	}
+
+	/**
 	 * Set a row's status (and its last_error message + updated_at timestamp).
 	 *
 	 * We store '' rather than NULL for last_error to keep $wpdb->update simple

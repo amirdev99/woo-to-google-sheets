@@ -128,9 +128,9 @@ the refresh token would be silently stripped before it was ever saved.**
 
 ### The form marker — why `sanitize()` branches
 
-Two forms now write this option: the Connection tab and the Fields tab. An unchecked checkbox
-is **not submitted at all**, so saving the Connection tab looks exactly like "the user
-unticked every field" — and would wipe the column selection.
+**Three** forms now write this option: the Connection tab, the Fields tab and the Status Tabs
+tab. An unchecked checkbox is **not submitted at all**, so saving the Connection tab looks
+exactly like "the user unticked every field" — and would wipe the column selection.
 
 Each form therefore posts a hidden `wtg_settings[_form]`, and `sanitize()` only rewrites the
 keys belonging to that form:
@@ -138,8 +138,9 @@ keys belonging to that form:
 ```php
 $form = isset( $input[ self::FORM_MARKER ] ) ? sanitize_key( $input[ self::FORM_MARKER ] ) : '';
 
-if ( 'connection' === $form ) { /* client_id, client_secret, spreadsheet_id, sheet_name */ }
-if ( 'fields' === $form )     { $output = $this->sanitize_fields( $input, $output, $existing ); }
+if ( 'connection' === $form )  { /* client_id, client_secret, spreadsheet_id, sheet_name */ }
+if ( 'fields' === $form )      { $output = $this->sanitize_fields( $input, $output, $existing ); }
+if ( 'status_tabs' === $form ) { $output = $this->sanitize_status_tabs( $input, $output ); }
 ```
 
 Programmatic token writes carry no marker, so they fall through **both** branches and leave
@@ -162,6 +163,29 @@ to click Write Header Row, and that rows already in the sheet keep the old layou
 guarded with `function_exists()` — `add_settings_error()` lives in
 `wp-admin/includes/template.php`, which is not loaded on every request, and `sanitize()` can
 run from any context including the OAuth callback on `admin-post.php`.
+
+### `sanitize_status_tabs( $input, $output )` — private
+
+Handles the Status Tabs tab: the switch, the routed statuses, the names. Four behaviours that
+are not obvious from the code:
+
+1. **It walks `Status_Tabs::available_statuses()` and keeps what was ticked** — the same
+   direction of travel as `sanitize_fields()`, so an unknown slug can never be stored and the
+   saved order always matches WooCommerce's own.
+2. **All ticked stores `array()`, not the full list.** An empty value *means* "all statuses" to
+   `Status_Tabs::tracked_statuses()`, so storing empty records the **intent** rather than a
+   snapshot of today's list — a status added later by WooCommerce or another plugin gets a tab
+   automatically.
+3. **Nothing ticked forces `enabled = false`**, with an `add_settings_error()` warning saying so.
+   Because empty already means "all", *"none"* is literally unstorable — and a feature that is
+   switched on but routes nothing would be a lie in the UI. Untick-everything is therefore read
+   as "switch it off", out loud rather than quietly.
+4. **WooCommerce inactive saves only the switch.** With no `wc_get_order_statuses()` the form
+   rendered no rows, so reading them would wipe a configuration this request could not even see.
+   The statuses and names are left exactly as stored.
+
+Names are stored **only where they differ from WooCommerce's label**, for the same reason
+`field_labels` is — improved default wording later reaches tabs the admin never renamed.
 
 ### Field renderers
 
@@ -231,8 +255,8 @@ Re-checks `current_user_can( 'manage_options' )` even though `add_menu_page()` a
 on it — defence in depth.
 
 Reads `$_GET['tab']` through `sanitize_key()` and validates it against a whitelist of
-`connection` / `sync_log`, falling back to `connection`. No nonce is needed because switching
-tabs changes no state.
+`connection` / `fields` / `status_tabs` / `sync_log`, falling back to `connection`. No nonce is
+needed because switching tabs changes no state.
 
 Tab URLs are built with `menu_page_url( self::MENU_SLUG, false )`, which resolves the correct
 parent file automatically — which is why the tabs needed no changes when the page moved.
@@ -277,6 +301,29 @@ One row per registry field, showing:
 same name — a disabled checkbox is not submitted, so without the hidden input the locked field
 would appear unticked on every save. (`sanitize_fields()` forces it in anyway; the hidden input
 means the two layers agree.)
+
+### `render_status_tabs_tab()` — private
+
+Rendered by hand for the same reason as the Fields tab, and posting to `options.php` under the
+same registered group. Everything on it is answered by the **static half** of
+`Status_Tabs`, so the screen never makes an HTTP call to Google.
+
+- an enable checkbox (`wtg_settings[status_tabs_enabled]`)
+- one row per `available_statuses()`: an **Include** checkbox
+  (`wtg_settings[status_tab_statuses][]`), the WooCommerce label with its slug in `<code>`, and
+  a **tab name** box (`wtg_settings[status_tab_names][<slug>]`)
+- a `notice-warning` instead of the table when WooCommerce is inactive
+
+Two details worth copying if you build a similar screen:
+
+**The name box is left empty when there is no override, and the *placeholder* shows the
+WooCommerce label.** That is what makes "clear the box" mean "go back to the default" — a
+pre-filled value would have to be compared against the label to detect the same intent.
+
+**Each row computes its effective name and flags a clash with the master tab in red**, using the
+same case-insensitive comparison `Status_Tabs` uses internally. Without this the sync would
+silently refuse that name and the admin would just see a tab that never appears. The rule itself
+is enforced in `Status_Tabs`, not here — this is only the explanation.
 
 `column_letter()` is a small private helper duplicating the same 0→A, 25→Z, 26→AA logic as
 `Sheets_Client::column_letter()`. Duplicated rather than shared because the admin layer should

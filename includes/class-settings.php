@@ -63,6 +63,16 @@ class Settings {
 			// that differ from the default are stored, so if a default label is
 			// improved in a later version, non-overridden columns follow it.
 			'field_labels'   => array(),
+
+			// --- Per-status tabs (Status Tabs tab) ----------------------------
+			// Off by default, so upgrading an existing install creates no tabs and
+			// moves no rows until the admin opts in. The meaning of these values
+			// (notably "empty statuses list = every status") belongs to
+			// WTG\Sheets\Status_Tabs, which owns the constants naming these keys —
+			// they are spelled out here only so every read has a predictable type.
+			'status_tabs_enabled' => false,
+			'status_tab_statuses' => array(), // Status slugs that get their own tab.
+			'status_tab_names'    => array(), // Slug => admin's tab name override.
 		);
 	}
 

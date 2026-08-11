@@ -20,6 +20,11 @@ button puts matching labels in row 1 — so the sheet's header, its data, and th
 describe the same columns. Include no per-product field and each order collapses to a single
 row instead of one per product.
 
+Optionally — **off by default** — each order status can also get its own tab. With that on, an
+order is additionally written to the tab for its current status and physically **moved** between
+those tabs as the status changes. The main tab keeps every order regardless; status tabs are in
+addition to it, never instead of it. See `11-status-tabs.md`.
+
 ## Full file tree
 
 ```
@@ -45,14 +50,17 @@ woo-to-google-sheets/
     ├── Queue/
     │   ├── class-sync-queue.php      All SQL against {prefix}wtg_sync_log
     │   └── class-sync-processor.php  The cron callback that actually syncs
+    ├── Sheets/
+    │   └── class-status-tabs.php     Which tab an order's status belongs on
     └── WooCommerce/
         ├── class-order-listener.php  Hooks WooCommerce order events → queue
         └── class-order-mapper.php    WC_Order → array of spreadsheet rows
 ```
 
-18 files under `includes/` plus the bootstrap, uninstaller and readme. There is **no `.git`
-folder** in this project, so nothing here is derived from commit history — see `09-development-timeline.md` for how the build order was
-reconstructed instead.
+16 files under `includes/` plus the bootstrap, uninstaller and readme. The docs from
+`09-development-timeline.md` were originally reconstructed by reading the code rather than a
+history — the project was not under version control when they were written — so treat the
+phase story there as inference, not as a commit log.
 
 ## Where to start reading
 
@@ -64,6 +72,7 @@ reconstructed instead.
 | Debug a sync that failed | `05-queue.md` then `03-google.md` |
 | Add a settings field | `06-admin.md` and `08-settings-reference.md` |
 | Add a column, status, or destination | `10-extending-the-plugin.md` |
+| Understand the per-status tabs, or test them | `11-status-tabs.md` |
 
 ## Diagram 1 — the main runtime flow
 
@@ -114,9 +123,26 @@ flowchart TD
     T --> W
     U --> W
 
-    S --> Y["Sync_Queue::mark SUCCESS"]
-    T --> Y
-    U --> Y
+    S --> AB
+    T --> AB
+    U --> AB
+
+    AB{"Per-status tabs enabled?"}
+    AB -->|"no (default)"| Y
+    AB -->|"yes"| AC["Sync_Processor::route()<br/>see 11-status-tabs.md"]
+
+    AC --> AD["1. find_rows_in_tabs()<br/>one batchGet across the status tabs"]
+    AD --> AE["2. write() to the tab for the current status<br/>sheet_id_for() creates it, with a header, if new"]
+    AE --> AF["3. delete_rows() from every OTHER status tab"]
+    AE --> W
+    AF --> W
+    AF --> Y
+
+    AD -->|"WP_Error"| Z
+    AE -->|"WP_Error — nothing deleted"| Z
+    AF -->|"WP_Error"| Z
+
+    Y["Sync_Queue::mark SUCCESS"]
     V --> Z["Sync_Queue::mark PENDING to retry,<br/>or FAILED after MAX_ATTEMPTS = 5"]
 
     Y --> H

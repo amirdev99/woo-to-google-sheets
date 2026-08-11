@@ -14,6 +14,7 @@ namespace WTG\WooCommerce;
 
 use WTG\Plugin;
 use WTG\Queue\Sync_Queue;
+use WTG\Queue\Sync_Runner;
 
 // Block direct access.
 if ( ! defined( 'ABSPATH' ) ) {
@@ -136,17 +137,26 @@ class Order_Listener {
 	}
 
 	/**
-	 * Ask WP-Cron to drain the queue as soon as possible.
+	 * Get the queue drained as soon as possible.
 	 *
-	 * WP-Cron is not a real clock: events only run when a request comes in. On a
-	 * quiet site (and especially a local dev site) the recurring 5-minute event
-	 * may not fire for a long time, which is why the queue previously appeared to
-	 * need the manual "Process Queue Now" button.
+	 * This used to call spawn_cron() and hope. spawn_cron() fires a non-blocking
+	 * loopback request to wp-cron.php — and that request is blocked outright in
+	 * plenty of normal setups (self-signed certificates on local and staging
+	 * sites, HTTP auth, hosts that firewall their own IP, DISABLE_WP_CRON). It is
+	 * sent with 'blocking' => false, so a total failure looks exactly like
+	 * success and nothing is ever logged. It also refuses to fire more than once
+	 * per 60 seconds, and takes its lock BEFORE trying, so one silently failed
+	 * loopback suppresses the next order's attempt as well.
 	 *
-	 * So we schedule a one-off event due NOW and call spawn_cron(), which fires a
-	 * non-blocking loopback request to the site. The sheet updates a second or
-	 * two after the order, and the customer's request is never held up waiting on
-	 * Google.
+	 * That is why orders appeared to need the manual "Process Queue Now" button.
+	 *
+	 * So the loopback is now the FALLBACK, not the plan. First choice is for this
+	 * very request to drain the queue itself once the response has been sent —
+	 * nothing in between to be blocked. Sync_Runner::run_soon() reports whether it
+	 * can do that; only when it cannot do we fall back to poking cron.
+	 *
+	 * Either way the one-off cron event is still scheduled, as a third line of
+	 * defence: if this request dies before shutdown, the row is not stranded.
 	 *
 	 * @return void
 	 */
@@ -157,10 +167,14 @@ class Order_Listener {
 			wp_schedule_single_event( time(), Plugin::CRON_HOOK_NOW );
 		}
 
-		// spawn_cron() self-limits to once every WP_CRON_LOCK_TIMEOUT (60s) and
-		// does nothing while cron is already running. If it declines, the event
-		// simply waits for the next request or the 5-minute recurring run — the
-		// row is never lost, only delayed.
+		if ( Sync_Runner::run_soon() ) {
+			return;
+		}
+
+		// No way to detach the response on this server and we are on the front end,
+		// so draining here would leave the customer watching a spinner while we
+		// talk to Google. Poke cron instead and let the admin catch-up and the
+		// five-minute event cover us — the row is never lost, only delayed.
 		spawn_cron();
 	}
 }

@@ -82,6 +82,29 @@ private function handle( $order_id, $status ) {
 — a draft becomes a real order later in the same request, and marking it handled while
 rejecting it would swallow that transition.
 
+⚠️ `EXCLUDED_STATUSES` is also read by `Status_Tabs::available_statuses()`, so excluding a status
+here removes it from the Status Tabs screen too — correctly, since a status that never syncs can
+never earn a tab. Excluding a status that already **has** a tab does not clean that tab up; its
+existing rows stay put, because nothing will ever sync those orders again to move them.
+
+---
+
+## Give a status a different tab name, or stop routing one
+
+No code needed — **Settings → WooCommerce to Google Sheets → Status Tabs**. Blank name means
+"use WooCommerce's own label"; unticking a status stops it getting a tab.
+
+Two things that surprise people, both by design:
+
+- **Renaming does not rename the tab in Google.** A new tab is created under the new name the
+  next time an order reaches that status. The old tab and its rows are left alone — the plugin
+  never deletes a *tab*, only rows. Move or delete it by hand if you want it gone.
+- **A name equal to your main tab is refused**, with a red warning on the screen. That protects
+  the master tab from the move logic's deletes. See `11-status-tabs.md`.
+
+To change the naming *rules* rather than one name, `Status_Tabs::raw_name_for()` is the single
+place the preference order (override → WooCommerce label → tidied slug) is decided.
+
 ---
 
 ## Change how often the background sync runs
@@ -148,6 +171,12 @@ Four edits:
 > listed there is silently stripped on save. This exact bug once made connecting appear to
 > succeed while discarding the refresh token.
 
+> **If your setting belongs to a new tab rather than the Connection tab**, give that form its
+> own `wtg_settings[_form]` marker value and its own branch in `sanitize()` — see
+> `08-settings-reference.md`. Without a marker, saving any *other* tab will wipe your keys,
+> because an unchecked checkbox is not submitted and looks identical to "the user cleared it".
+> `sanitize_status_tabs()` is the newest example to copy.
+
 ---
 
 ## Add a button to the Sync Log
@@ -180,8 +209,13 @@ Then in `Sync_Processor::process()`, replace:
 $sheets = new Sheets_Client();
 ```
 
-Nothing else needs to change. `Order_Mapper` produces plain arrays and `Sync_Queue` stores
-plain rows — neither knows Google exists.
+Nothing else needs to change **if per-status tabs stay off**. `Order_Mapper` produces plain
+arrays and `Sync_Queue` stores plain rows — neither knows Google exists.
+
+If you want routing at the new destination too, note that `Status_Tabs` type-hints
+`Sheets_Client` in its constructor and uses four methods beyond that trio
+(`get_sheet_map`, `find_rows_in_tabs`, `create_sheet`, `delete_rows`). Extract an interface
+covering all seven before swapping the client, or leave `$tabs` null for the new destination.
 
 For a proper multi-destination plugin, extract an interface and let `process()` loop over
 registered destinations. The queue's `status` column would then need to become per

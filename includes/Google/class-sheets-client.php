@@ -155,9 +155,36 @@ class Sheets_Client {
 	/**
 	 * List the tab names inside a spreadsheet.
 	 *
+	 * A thin wrapper over get_sheet_map() — same single request, just the titles.
+	 * Kept as its own method because the settings page only ever wants names, and
+	 * reading `array_keys( $map )` at every call site would leak the detail that a
+	 * map exists at all.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return array|\WP_Error List of tab title strings, in sheet order.
+	 */
+	public function list_sheet_titles( $spreadsheet_id, $access_token ) {
+		$map = $this->get_sheet_map( $spreadsheet_id, $access_token );
+
+		if ( is_wp_error( $map ) ) {
+			return $map;
+		}
+
+		return array_keys( $map );
+	}
+
+	/**
+	 * Map every tab in a spreadsheet to its numeric sheet ID.
+	 *
 	 * Uses spreadsheets.get with a `fields` mask so Google returns only the tab
-	 * titles rather than the entire document, which for a large sheet would be a
-	 * very expensive response.
+	 * properties rather than the entire document, which for a large sheet would be
+	 * a very expensive response.
+	 *
+	 * The numeric ID matters because the A1 notation used everywhere else in this
+	 * class can NAME a tab but cannot address it structurally. Adding or deleting
+	 * rows goes through spreadsheets:batchUpdate, which identifies a tab only by
+	 * its `sheetId` — so anything that reshapes a sheet has to start here.
 	 *
 	 * Needs no extra permission: the existing auth/spreadsheets scope already
 	 * covers reading a spreadsheet whose ID we hold. Only the *file listing* on
@@ -165,10 +192,10 @@ class Sheets_Client {
 	 *
 	 * @param string $spreadsheet_id Target spreadsheet.
 	 * @param string $access_token   Valid OAuth access token.
-	 * @return array|\WP_Error List of tab title strings, in sheet order.
+	 * @return array|\WP_Error Title => sheetId (int), in sheet order.
 	 */
-	public function list_sheet_titles( $spreadsheet_id, $access_token ) {
-		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '?fields=sheets.properties.title';
+	public function get_sheet_map( $spreadsheet_id, $access_token ) {
+		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '?fields=sheets.properties(title,sheetId)';
 
 		$response = wp_remote_get(
 			$url,
@@ -183,18 +210,221 @@ class Sheets_Client {
 			return $error;
 		}
 
-		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
-		$titles = array();
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+		$map  = array();
 
 		if ( isset( $data['sheets'] ) && is_array( $data['sheets'] ) ) {
 			foreach ( $data['sheets'] as $sheet ) {
-				if ( isset( $sheet['properties']['title'] ) && '' !== $sheet['properties']['title'] ) {
-					$titles[] = (string) $sheet['properties']['title'];
+				$props = isset( $sheet['properties'] ) ? $sheet['properties'] : array();
+
+				// sheetId 0 is legitimate (it is the first tab of every new
+				// spreadsheet), so test for PRESENCE, never for truthiness.
+				if ( isset( $props['title'], $props['sheetId'] ) && '' !== $props['title'] ) {
+					$map[ (string) $props['title'] ] = (int) $props['sheetId'];
 				}
 			}
 		}
 
-		return $titles;
+		return $map;
+	}
+
+	/**
+	 * Find an order's rows across SEVERAL tabs in a single request.
+	 *
+	 * The per-status-tab feature has to answer "where does this order currently
+	 * live?", and the honest answer requires looking in every candidate tab. Doing
+	 * that with find_rows_by_order_id() would cost one HTTP request per tab, per
+	 * order. values:batchGet takes many ranges at once, so the whole question costs
+	 * exactly one request no matter how many tabs exist.
+	 *
+	 * Results are matched back to tabs BY POSITION, not by parsing the `range`
+	 * string Google echoes back: it re-quotes and normalises names ("Sheet1!A1:A9"
+	 * vs "'On hold'!A1:A9"), so string-matching it is fragile. The API documents
+	 * valueRanges as parallel to the ranges requested, which is stable.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param array  $sheet_names    Tab names to search.
+	 * @param int    $order_id       WooCommerce order ID to find.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return array|\WP_Error Tab name => ascending list of 1-based row numbers.
+	 *                         Tabs where the order is absent are omitted entirely.
+	 */
+	public function find_rows_in_tabs( $spreadsheet_id, array $sheet_names, $order_id, $access_token ) {
+		$sheet_names = array_values( array_unique( array_filter( $sheet_names, 'strlen' ) ) );
+
+		if ( empty( $sheet_names ) ) {
+			return array(); // Nothing to search is not an error.
+		}
+
+		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '/values:batchGet';
+
+		// add_query_arg cannot express a repeated key, so the ranges are appended
+		// by hand — batchGet wants ?ranges=A&ranges=B, not ranges[]=A.
+		$query = array( 'majorDimension=COLUMNS' );
+		foreach ( $sheet_names as $name ) {
+			$range   = $this->a1_sheet( $name ) . '!' . self::ORDER_ID_COLUMN . ':' . self::ORDER_ID_COLUMN;
+			$query[] = 'ranges=' . rawurlencode( $range );
+		}
+
+		$response = wp_remote_get(
+			$url . '?' . implode( '&', $query ),
+			array(
+				'timeout' => 20,
+				'headers' => array( 'Authorization' => 'Bearer ' . $access_token ),
+			)
+		);
+
+		$error = $this->response_error( $response, 'wtg_lookup_failed' );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+		$ranges = isset( $data['valueRanges'] ) && is_array( $data['valueRanges'] ) ? $data['valueRanges'] : array();
+
+		$needle = (string) $order_id;
+		$found  = array();
+
+		foreach ( $sheet_names as $i => $name ) {
+			// A tab with an empty column A omits "values" entirely — not an error.
+			if ( ! isset( $ranges[ $i ]['values'][0] ) || ! is_array( $ranges[ $i ]['values'][0] ) ) {
+				continue;
+			}
+
+			$rows = array();
+			foreach ( $ranges[ $i ]['values'][0] as $index => $cell ) {
+				// Trimmed string compare: the API hands back "14670" or 14670
+				// depending on how the cell was entered. Same rule as
+				// find_rows_by_order_id(), deliberately.
+				if ( trim( (string) $cell ) === $needle ) {
+					$rows[] = $index + 1; // Sheet rows are 1-based; array keys are 0-based.
+				}
+			}
+
+			if ( ! empty( $rows ) ) {
+				$found[ $name ] = $rows;
+			}
+		}
+
+		return $found;
+	}
+
+	/**
+	 * Create a new tab in the spreadsheet.
+	 *
+	 * Returns the new tab's numeric ID so the caller can immediately act on it
+	 * without a second get_sheet_map() round trip.
+	 *
+	 * A duplicate title is reported as its own error code so the caller can treat
+	 * it as "fine, it already exists" rather than a real failure — that race is
+	 * genuinely possible when two cron runs overlap on the first order to reach a
+	 * given status.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param string $title          Tab name to create.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return int|\WP_Error New sheetId.
+	 */
+	public function create_sheet( $spreadsheet_id, $title, $access_token ) {
+		$title = trim( (string) $title );
+
+		if ( '' === $title ) {
+			return new \WP_Error(
+				'wtg_create_sheet_failed',
+				__( 'Cannot create a sheet tab with an empty name.', 'woo-to-gsheet' )
+			);
+		}
+
+		$result = $this->batch_update(
+			$spreadsheet_id,
+			array(
+				array(
+					'addSheet' => array(
+						'properties' => array( 'title' => $title ),
+					),
+				),
+			),
+			$access_token,
+			'wtg_create_sheet_failed'
+		);
+
+		if ( is_wp_error( $result ) ) {
+			// Google's message for a taken name is "A sheet with the name ... already
+			// exists". Re-code it so the caller can recover instead of retrying.
+			if ( false !== stripos( $result->get_error_message(), 'already exists' ) ) {
+				return new \WP_Error( 'wtg_sheet_exists', $result->get_error_message() );
+			}
+
+			return $result;
+		}
+
+		if ( ! isset( $result['replies'][0]['addSheet']['properties']['sheetId'] ) ) {
+			return new \WP_Error(
+				'wtg_create_sheet_failed',
+				/* translators: %s: tab name. */
+				sprintf( __( 'Google did not report an ID for the new "%s" tab.', 'woo-to-gsheet' ), $title )
+			);
+		}
+
+		return (int) $result['replies'][0]['addSheet']['properties']['sheetId'];
+	}
+
+	/**
+	 * Delete specific rows from a tab.
+	 *
+	 * This is the one destructive call in the plugin, so it is deliberately blunt:
+	 * it takes explicit row numbers and does nothing clever. Callers are expected
+	 * to pass ONLY row numbers returned by an order-ID lookup, which can never
+	 * include a header row (the text "Order ID" does not equal an order number).
+	 *
+	 * Rows are deleted HIGHEST FIRST. Deleting row 3 shifts row 7 up to row 6, so
+	 * working downwards would make every subsequent number wrong — descending order
+	 * means the rows still waiting to be deleted have not moved yet.
+	 *
+	 * Ranges are half-open and 0-based here (deleteDimension), unlike the 1-based
+	 * inclusive rows used everywhere else in this class, so row N becomes
+	 * startIndex N-1, endIndex N.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param int    $sheet_id       Numeric tab ID from get_sheet_map().
+	 * @param array  $row_numbers    1-based rows to delete.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @return true|\WP_Error
+	 */
+	public function delete_rows( $spreadsheet_id, $sheet_id, array $row_numbers, $access_token ) {
+		// Ignore anything that is not a real row, so a stray 0 can never be turned
+		// into startIndex -1 and rejected (or worse, misread) by the API.
+		$rows = array();
+		foreach ( $row_numbers as $number ) {
+			$number = (int) $number;
+			if ( $number >= 1 ) {
+				$rows[ $number ] = $number; // Keyed, so duplicates collapse.
+			}
+		}
+
+		if ( empty( $rows ) ) {
+			return true; // Nothing to do is not an error.
+		}
+
+		rsort( $rows ); // Highest row first — see the docblock.
+
+		$requests = array();
+		foreach ( $rows as $number ) {
+			$requests[] = array(
+				'deleteDimension' => array(
+					'range' => array(
+						'sheetId'    => (int) $sheet_id,
+						'dimension'  => 'ROWS',
+						'startIndex' => $number - 1,
+						'endIndex'   => $number,
+					),
+				),
+			);
+		}
+
+		$result = $this->batch_update( $spreadsheet_id, $requests, $access_token, 'wtg_delete_rows_failed' );
+
+		return is_wp_error( $result ) ? $result : true;
 	}
 
 	/**
@@ -329,6 +559,51 @@ class Sheets_Client {
 	/* ---------------------------------------------------------------------- *
 	 * Helpers.
 	 * ---------------------------------------------------------------------- */
+
+	/**
+	 * POST a set of requests to spreadsheets:batchUpdate and hand back the reply.
+	 *
+	 * Note this is a DIFFERENT endpoint from values:batchUpdate used by
+	 * update_rows(). That one edits cell contents; this one changes the structure
+	 * of the document — adding tabs, deleting rows. They are easy to confuse, which
+	 * is precisely why the structural calls are funnelled through one helper.
+	 *
+	 * Google applies the requests in order and atomically: if one fails, none are
+	 * applied. That is what makes a multi-row delete safe to send as one call.
+	 *
+	 * @param string $spreadsheet_id Target spreadsheet.
+	 * @param array  $requests       List of request objects.
+	 * @param string $access_token   Valid OAuth access token.
+	 * @param string $code           Error code to report a failure under.
+	 * @return array|\WP_Error Decoded response body.
+	 */
+	private function batch_update( $spreadsheet_id, array $requests, $access_token, $code ) {
+		$body = $this->encode( array( 'requests' => array_values( $requests ) ) );
+		if ( is_wp_error( $body ) ) {
+			return $body;
+		}
+
+		$response = wp_remote_post(
+			self::API_BASE . rawurlencode( $spreadsheet_id ) . ':batchUpdate',
+			array(
+				'timeout' => 20,
+				'headers' => array(
+					'Authorization' => 'Bearer ' . $access_token,
+					'Content-Type'  => 'application/json',
+				),
+				'body'    => $body,
+			)
+		);
+
+		$error = $this->response_error( $response, $code );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		$data = json_decode( wp_remote_retrieve_body( $response ), true );
+
+		return is_array( $data ) ? $data : array();
+	}
 
 	/**
 	 * Force a list of rows into the exact shape the API expects: a plain 2D array

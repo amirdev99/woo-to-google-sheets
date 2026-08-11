@@ -1,9 +1,9 @@
 # 01 — Architecture: how the folders relate
 
-The plugin has four sub-folders under `includes/`, plus five loose files at the
+The plugin has five sub-folders under `includes/`, plus five loose files at the
 `includes/` root. Each folder is a **namespace** (`WTG\Google\`, `WTG\Queue\`,
-`WTG\WooCommerce\`, `WTG\Admin\`), and the split is not cosmetic — each one owns exactly
-one kind of risk.
+`WTG\WooCommerce\`, `WTG\Sheets\`, `WTG\Admin\`), and the split is not cosmetic — each one owns
+exactly one kind of risk.
 
 ## The one-sentence version of each folder
 
@@ -13,6 +13,7 @@ one kind of risk.
 | `includes/WooCommerce/` | Knowing what a WooCommerce order *is* | Talk to Google, or run SQL |
 | `includes/Queue/` | The `wtg_sync_log` table and the sync algorithm | Know how HTTP or OAuth works |
 | `includes/Google/` | HTTP conversations with Google | Know what an "order" is |
+| `includes/Sheets/` | Which *tab* a row belongs on | Decide what a row contains, or run the sync |
 | `includes/Admin/` | Buttons, forms, screens, nonces | Contain business logic |
 
 The rule that falls out of this: **an order object never reaches `Google/`, and an access
@@ -169,12 +170,55 @@ exists in exactly one place.
 - `OAuth_Client` depends on **only** `WTG\Settings`. Called by
   `Queue\Sync_Processor`, `Admin\OAuth_Controller`, and `Admin\Settings_Page`
   (which uses `is_connected()` and `has_credentials()` to decide which buttons to show).
-- `Sheets_Client` has **no `use` statements** — zero plugin dependencies. Its only caller is
-  `Queue\Sync_Processor`.
+- `Sheets_Client` has **no `use` statements** — zero plugin dependencies. Its callers are
+  `Queue\Sync_Processor`, `Sheets\Status_Tabs`, and `Admin\` for the dropdowns and the header
+  button.
 - One wrinkle worth knowing: `Admin\OAuth_Controller::fetch_spreadsheet_title()` makes its
   own small Sheets request using its own `SHEETS_API` constant, rather than going through
   `Sheets_Client`. See `06-admin.md` for why, and `10-extending-the-plugin.md` for how to
   consolidate it.
+
+---
+
+## `includes/Sheets/` — which tab a row belongs on
+
+**Files:** `class-status-tabs.php`
+
+### Why it exists as its own module
+
+`Google/` knows how to talk to a spreadsheet but not what an order is. `WooCommerce/` knows what
+an order is but never touches Google. **"An order with status X belongs on a tab called Y"** is
+a third kind of knowledge — a policy about the *document's shape* — and it fits in neither.
+
+Putting it in `Google/` would give the transport layer an opinion about order statuses. Putting
+it in `WooCommerce/` would make the mapper reach for an access token. It lives here instead, and
+`Queue/` is where it meets the sync — exactly as `Order_Mapper` and `Sheets_Client` do.
+
+The class is deliberately split down the middle: **static methods answer naming questions from
+`Settings` alone with no HTTP**, so the admin screen can render the whole configuration UI
+without a network call, while **instance methods resolve a name to a real sheet** and are the
+only half that talks to Google.
+
+### What breaks if you merge it away
+
+- Folded into `Sync_Processor`, the settings page could no longer ask "what would these tabs be
+  called?" without either duplicating the naming rules or instantiating the processor.
+- The master-tab safety rule (`11-status-tabs.md`) is enforced in **two** places inside this
+  class, on purpose. Scattered across the processor and the admin page, a future caller would
+  eventually skip it — and the failure mode is deleting rows from the master tab.
+- The per-batch map cache lives on the instance. Merged into a static helper it would become a
+  global, or vanish and cost one HTTP request per order.
+
+### Who talks to whom
+
+- **Depends on:** `WTG\Settings` (all naming policy), `WTG\Google\Sheets_Client` (map + create),
+  `WTG\WooCommerce\Order_Mapper` (`header()`, for a new tab's header row),
+  `WTG\WooCommerce\Order_Listener` (`EXCLUDED_STATUSES`, so a draft never earns a tab).
+- **Called by:** `Queue\Sync_Processor::route()` (static *and* instance halves) and
+  `Admin\Settings_Page::render_status_tabs_tab()` / `sanitize_status_tabs()` (static half only).
+- **Note the shape:** this is the one module that depends on `WooCommerce/` *and* `Google/`
+  without being `Queue/`. It never handles an order object — only a status *slug* — which is
+  what keeps that from breaking the "an order never reaches Google" rule.
 
 ---
 
@@ -238,6 +282,9 @@ flowchart LR
         OC["OAuth_Client"]
         SC["Sheets_Client"]
     end
+    subgraph sh["includes/Sheets/"]
+        ST["Status_Tabs"]
+    end
     subgraph adm["includes/Admin/"]
         SPG["Settings_Page"]
         OCT["OAuth_Controller"]
@@ -251,6 +298,12 @@ flowchart LR
     SP --> OC
     SP --> SC
     SP --> S
+    SP --> ST
+    ST --> S
+    ST --> SC
+    ST --> OM
+    ST --> OL
+    SPG --> ST
     SQ --> P
     OC --> S
     OM --> S
@@ -279,6 +332,10 @@ Two things to notice:
    users choose their columns.
 2. **`Sync_Processor` is the hub.** It is the only class importing from three different
    modules. If a change feels hard, it is usually because it belongs here.
-3. **`Order_Mapper` now has three callers**, not one. `header()` and `fields()` are read by
-   the admin layer as well as by the sync, which is what keeps the sheet's header row, the
-   data rows, and the settings checklist all describing the same columns.
+3. **`Order_Mapper` now has four callers**, not one. `header()` and `fields()` are read by
+   the admin layer and by `Status_Tabs` as well as by the sync, which is what keeps the sheet's
+   header row, the data rows, a newly created status tab's header, and the settings checklist
+   all describing the same columns.
+4. **`Status_Tabs` is the only node with an arrow into both `WooCommerce/` and `Google/`**
+   without being the processor. That is allowed because it only ever handles a status *slug*,
+   never an order object — see its section above.

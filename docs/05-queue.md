@@ -182,7 +182,8 @@ link. Note the difference from `requeue()`: this takes a **row id**, `requeue()`
 order, decide append-or-update, and record the outcome.
 
 **Depends on:** `WTG\Settings`, `WTG\Google\OAuth_Client`, `WTG\Google\Sheets_Client`,
-`WTG\WooCommerce\Order_Mapper` — plus `Sync_Queue` from its own namespace.
+`WTG\WooCommerce\Order_Mapper`, `WTG\Sheets\Status_Tabs` — plus `Sync_Queue` from its own
+namespace.
 **Called by:** WordPress via `Plugin::CRON_HOOK` and `Plugin::CRON_HOOK_NOW`, and directly by
 `Admin\Queue_Controller::handle_process_now()`.
 
@@ -209,6 +210,17 @@ if ( empty( $rows ) ) { return $counts; }              // nothing to do
 Bailing **before** touching any row leaves everything `pending`. Nothing is consumed, nothing
 is marked failed, and no attempt is burned — so when the admin reconnects, the backlog syncs
 untouched. One token is fetched once and reused for the whole batch.
+
+**One more thing is built before the loop**, and its placement is the point:
+
+```php
+$tabs = Status_Tabs::is_enabled() ? new Status_Tabs( $sheets, $spreadsheet_id, $token ) : null;
+```
+
+A `Status_Tabs` instance caches the spreadsheet's tab map, so building it **outside** the loop
+makes a batch of twenty orders cost *one* map lookup instead of twenty. And `null` when the
+feature is off is the same value the loop tests, so a disabled install does literally no extra
+work — no branch inside the loop ever fires.
 
 ### The per-row loop
 
@@ -258,7 +270,24 @@ This is subtle and important. If a network blip made the lookup fail and we trea
 "the order isn't in the sheet", we would **append a duplicate** on every retry. Treating it as
 a send failure routes it through the normal retry path instead.
 
-**5. Record the outcome.**
+**5. Second phase — route to a status tab, if the feature is on.**
+
+```php
+if ( ! is_wp_error( $result ) && null !== $tabs ) {
+    $result = $this->route( $tabs, $sheets, $spreadsheet_id, $order, $new_rows, $token );
+}
+```
+
+Two guards, each doing real work. **Only after the master write succeeded**: if the master is
+broken (bad token, deleted spreadsheet) there is no point spending more requests to discover the
+same thing again. **Only when `$tabs` is non-null**: feature off means this line is the entire
+cost.
+
+A `route()` failure becomes `$result` and falls into the normal ladder below. The master write
+that already happened is not rolled back — it does not need to be, because it is idempotent, so
+the retry simply overwrites the same rows.
+
+**6. Record the outcome.**
 
 ```php
 if ( is_wp_error( $result ) ) {
@@ -276,9 +305,34 @@ A retryable failure goes back to `pending` **but keeps its error message**, so t
 shows why it is still trying. After 5 attempts it becomes `failed`, which is where the manual
 Retry link takes over.
 
+### `route( … )` — private
+
+Moves an order onto the tab for its current status and off every other status tab. Full design
+rationale in **`11-status-tabs.md`**; the summary:
+
+| Step | Call | Note |
+|---|---|---|
+| 1. Ask | `existing_tab_names()` then `find_rows_in_tabs()` | Nothing is stored about where an order lives — a lookup always tells the truth. One request, all tabs |
+| 2. Write | `sheet_id_for( $target )` then `write( … )` | `sheet_id_for()` comes first because it is what **creates** the tab and its header |
+| 3. Delete | `delete_rows()` on every found tab except `$target` | Addresses tabs by numeric ID; a cached map read, not a request |
+
+**Write before delete, never the reverse.** Dying between steps 2 and 3 leaves the order visible
+on two tabs — untidy, obvious, and healed by the next sync. Dying after a delete-first would
+lose the row.
+
+**`$target === ''` still runs step 3.** A status with no tab (untracked, or its name clashes with
+the master tab) skips the write but is still swept off the tab it used to be on — "belongs on no
+status tab" is a real destination.
+
+**A failed search returns the error** rather than falling through to a blind append, the same
+rule as the master lookup, for the same reason: a transient error must never duplicate an order.
+
+Nothing in `route()` touches the master tab.
+
 ### `write( … )` — private
 
-The upsert decision. Three handled cases and one deliberate refusal:
+The upsert decision, used by **both** the master tab and — verbatim — each status tab, so the
+two get identical behaviour. Three handled cases and one deliberate refusal:
 
 | Situation | Action |
 |---|---|
@@ -297,9 +351,21 @@ instead the plugin reports:
 Note the ordering in the grow case: the update is attempted first and its error returned
 immediately if it fails, so the append only runs once the overlap is safely written.
 
+⚠️ **`route()` does delete rows — that is not a contradiction.** The two are different
+decisions. `write()` refuses to delete in order to *reconcile a product count*, where the right
+row count is a guess. `route()` deletes only rows an order-ID lookup returned moments earlier,
+and only to move an order between status tabs — never on the master tab. If you are tempted to
+"simplify" by letting `write()` use `delete_rows()`, re-read both docblocks first.
+
 ### Verified behaviour
 
-The decision table above was exercised directly during development with a stubbed client —
-new 1-product and 3-product orders, status changes at both sizes, a product added (2→3), rows
-that are **not adjacent** (rows 2 and 40, simulating a manually sorted sheet), and a product
-removed. All produced the expected call sequence.
+The `write()` decision table above was exercised directly during development with a stubbed
+client — new 1-product and 3-product orders, status changes at both sizes, a product added
+(2→3), rows that are **not adjacent** (rows 2 and 40, simulating a manually sorted sheet), and a
+product removed. All produced the expected call sequence.
+
+`route()` was exercised the same way, against a fake `Sheets_Client` that logged the **order** of
+calls — first order creating a tab, a move between tabs, an in-place update, an untracked status
+being swept, the master-tab clash, every failure path including *"the write fails, so nothing is
+deleted"*, two stale tabs at once, the shrink guard on a status tab, added products, and the
+one-map-lookup-per-batch guarantee.

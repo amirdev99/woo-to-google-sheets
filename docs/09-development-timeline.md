@@ -239,6 +239,34 @@ The rebuild differs from the first attempt in three ways:
 - Every failure path **falls back to the original text input**, so a missing permission or an
   API error can never leave the settings page unusable.
 
+### 13. Per-status tabs
+
+The largest addition after the six phases, and the first to introduce a **new namespace**
+(`WTG\Sheets\`) since the original layout. Built deliberately bottom-up, one file at a time,
+each step verified before the next began:
+
+| Step | File | What it added |
+|---|---|---|
+| 1 | `Google/class-sheets-client.php` | `get_sheet_map()`, `find_rows_in_tabs()`, `create_sheet()`, `delete_rows()`, private `batch_update()` |
+| 2 | `Sheets/class-status-tabs.php` | All naming policy + sheet resolution, split static/instance |
+| 3 | `class-settings.php`, `Admin/class-settings-page.php` | Three defaults, the Status Tabs screen, `sanitize_status_tabs()` |
+| 4 | `Queue/class-sync-processor.php` | `route()`, and the one `$tabs` instance built outside the loop |
+| 5 | `docs/` | This documentation and `11-status-tabs.md` |
+
+Two design choices were settled before any code was written, and both shaped everything after:
+
+**Real routing, not formula views.** Rows physically move, so each tab is real data a human can
+sort and edit — rather than a `FILTER()` derivative that would overwrite their edits.
+
+**Keep the master tab.** Status tabs are *in addition* to `sheet_name`, never instead of it,
+which is what makes the feature safe to switch on and off at any time.
+
+The consequence is that this feature **walks back `Sync_Processor::write()`'s "never delete
+rows" stance** — moving an order is impossible without deletion. The walk-back is deliberately
+narrow: only rows an order-ID lookup just returned, only to move between status tabs, and never
+on the master tab. Write-before-delete is the invariant that makes a mid-run crash cost a
+visible duplicate rather than lost data.
+
 ---
 
 ## Dependency order (independent of the phase comments)
@@ -251,14 +279,15 @@ Plugin (constants) ────┼──> Sync_Queue ──> Order_Listener
 Autoloader ────────────┘         │
                                  └──> Sync_Processor <── Order_Mapper
 OAuth_Client ────────────────────────────┤            <── Sheets_Client
-                                         │
+                                         │            <── Status_Tabs
 Settings_Page ──> OAuth_Controller ──────┘
               └─> Queue_Controller
 ```
 
-`Sheets_Client` and `Order_Mapper` are leaves — nothing depends on them but
-`Sync_Processor` — which is why the column format could be rewritten three times without
-touching anything else.
+`Sheets_Client` is still the only true leaf. `Order_Mapper` stopped being one when the Fields
+tab made it read `Settings`, and `Status_Tabs` was built on top of both — which is why the
+column format could be rewritten three times early on without touching anything else, but a
+change to `Order_Mapper::header()` now also changes what a newly created status tab looks like.
 
 ---
 

@@ -116,6 +116,16 @@ Retry.
 One row **per order**, not per product. A 3-product order is a single queue row that becomes
 3 rows in the Google Sheet. The table only grows with order count, and `Clear Log` trims it.
 
+### What is deliberately **not** stored
+
+There is no column recording **where** an order's rows are — not a row number on the master tab,
+and not a tab name once per-status tabs are enabled. Both are looked up fresh on every sync.
+
+A spreadsheet is a document humans sort, edit and delete rows in. Any location this table
+remembered would go stale silently, and acting on a stale location means writing over — or
+deleting — the wrong row. A lookup always tells the truth, and it costs one request per batch.
+See `11-status-tabs.md`.
+
 ---
 
 ## Options
@@ -124,7 +134,7 @@ Both live in `wp_options`. Full field-by-field detail in `08-settings-reference.
 
 | Option | Written by | Read by | Shape |
 |---|---|---|---|
-| `wtg_settings` | `Settings::set()` / `update()`, and `options.php` via `Settings_Page::sanitize()` | `Settings::all()` | Serialized array of 8 keys |
+| `wtg_settings` | `Settings::set()` / `update()`, and `options.php` via `Settings_Page::sanitize()` | `Settings::all()` | Serialized array of 13 keys |
 | `wtg_db_version` | `Activator::create_table()` | `Activator::maybe_install()` | Schema version string, currently `1.0.0` |
 
 `wtg_db_version` holds the **schema** version (`Activator::DB_VERSION`), deliberately separate

@@ -149,12 +149,13 @@ final class Plugin {
 		// WooCommerce present.
 		( new WooCommerce\Order_Listener() )->hooks();
 
-		// The cron events drain the queue. Attach the processor in every context,
-		// since WP-Cron runs in its own request. One processor instance serves
-		// both the recurring 5-minute safety net and the immediate one-off kick.
-		$processor = new Queue\Sync_Processor();
-		add_action( self::CRON_HOOK, array( $processor, 'process' ) );
-		add_action( self::CRON_HOOK_NOW, array( $processor, 'process' ) );
+		// The cron events drain the queue. Attach in every context, since WP-Cron
+		// runs in its own request. Both the recurring 5-minute safety net and the
+		// immediate one-off kick go through Sync_Runner rather than calling the
+		// processor directly, so that EVERY trigger — cron, checkout, admin
+		// catch-up, the manual button — shares one lock and can never overlap.
+		add_action( self::CRON_HOOK, array( 'WTG\\Queue\\Sync_Runner', 'run' ) );
+		add_action( self::CRON_HOOK_NOW, array( 'WTG\\Queue\\Sync_Runner', 'run' ) );
 
 		// --- Admin-only wiring --------------------------------------------------
 		// is_admin() is true for wp-admin, admin-ajax and admin-post requests, and
@@ -166,6 +167,11 @@ final class Plugin {
 			// Admin-only: a broken install should be repaired by an admin visiting
 			// wp-admin, not by a front-end visitor's request.
 			add_action( 'admin_init', array( 'WTG\\Activator', 'maybe_install' ) );
+
+			// Catch-up layer: if WP-Cron is not firing (a quiet shop, a blocked
+			// loopback, DISABLE_WP_CRON), any admin page load drains the backlog.
+			// Costs one transient read when there is nothing to do.
+			add_action( 'admin_init', array( 'WTG\\Queue\\Sync_Runner', 'catch_up' ) );
 
 			( new Admin\Settings_Page() )->hooks();
 			// Connect/callback/disconnect/test admin-post actions + their notices.

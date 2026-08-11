@@ -11,7 +11,7 @@
 namespace WTG\Admin;
 
 use WTG\Queue\Sync_Queue;
-use WTG\Queue\Sync_Processor;
+use WTG\Queue\Sync_Runner;
 
 // Block direct access.
 if ( ! defined( 'ABSPATH' ) ) {
@@ -117,7 +117,18 @@ class Queue_Controller {
 	public function handle_process_now() {
 		$this->authorize( self::ACTION_PROCESS_NOW );
 
-		$counts = ( new Sync_Processor() )->process();
+		$counts = Sync_Runner::run();
+
+		// null means an automatic run already had the lock. Say so plainly rather
+		// than reporting "0 attempted", which reads like nothing was waiting.
+		if ( null === $counts ) {
+			$this->set_notice(
+				'success',
+				__( 'A sync was already running — your orders are being sent now. Reload in a moment to see the result.', 'woo-to-gsheet' )
+			);
+			$this->redirect_to_log();
+			return;
+		}
 
 		$this->set_notice(
 			'success',

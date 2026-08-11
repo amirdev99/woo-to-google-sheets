@@ -187,12 +187,16 @@ into `token_expires` (an absolute timestamp, easier to compare later), and write
 
 ## `class-sheets-client.php` — `WTG\Google\Sheets_Client`
 
-**Purpose.** Four operations against the Sheets API v4 `values` endpoints. Three of them let
-the processor "upsert" — append new rows, find an order's existing rows, overwrite rows in
-place — and the fourth reads a row back, which the Write Header Row button needs.
+**Purpose.** Operations against the Sheets API v4, in two families:
+
+- **`values` endpoints** — the upsert: append new rows, find an order's existing rows, overwrite
+  rows in place, plus reading a row back for the Write Header Row button.
+- **structural endpoints** — added for per-status tabs: map the tabs, search several tabs at
+  once, create a tab, delete rows.
 
 **Depends on:** nothing. **Zero `use` statements** — the most isolated class in the plugin.
-**Called by:** `Queue\Sync_Processor`, and `Admin\OAuth_Controller` for the header button.
+**Called by:** `Queue\Sync_Processor`, `Sheets\Status_Tabs`, and `Admin\` for the header button
+and the two dropdowns.
 
 ### Constants
 
@@ -322,16 +326,107 @@ apostrophe is A1 notation's own escaping rule.
 
 ### `list_sheet_titles( $spreadsheet_id, $access_token )`
 
-`GET {API_BASE}{id}?fields=sheets.properties.title`
+Returns the tab names inside a spreadsheet, in sheet order. Backs the **Sheets List** dropdown.
 
-Returns the tab names inside a spreadsheet, in sheet order. Backs the **Sheets List**
-dropdown.
+It is now a **one-line wrapper over `get_sheet_map()`** — `array_keys( $map )`. Kept as its own
+method because "give me the tab names" is what most callers actually mean, and making them read
+`array_keys()` at every call site would leak the detail that a map exists at all.
 
-The `fields` mask matters: without it, `spreadsheets.get` returns the entire document, which
-for a large sheet is an enormous response when all we want is a handful of strings.
+---
 
-**Needs no extra permission.** `auth/spreadsheets` already covers reading a spreadsheet whose
-ID we hold — only the *file listing* below requires Drive.
+## The structural methods (per-status tabs)
+
+These four were added for the feature in `11-status-tabs.md`. Read that first if you want the
+*why*; this section is the *what*.
+
+### `get_sheet_map( $spreadsheet_id, $access_token )`
+
+`GET {API_BASE}{id}?fields=sheets.properties(title,sheetId)`
+
+Returns `title => sheetId` for every tab, in sheet order.
+
+**Why the numeric ID matters:** the A1 notation used everywhere else in this class can *name* a
+tab but cannot address it structurally. `spreadsheets:batchUpdate` — which is how you add or
+delete anything — identifies a tab **only** by its `sheetId`. So anything that reshapes a sheet
+has to start here.
+
+The `fields` mask matters: without it, `spreadsheets.get` returns the entire document, which for
+a large sheet is an enormous response when all we want is a handful of strings.
+
+⚠️ **`sheetId` 0 is legitimate** — it is the first tab of every new spreadsheet. The parser
+therefore tests for the key's *presence*, never its truthiness. A `! empty()` here would make
+the plugin silently unable to address the most common tab in existence.
+
+**Needs no extra permission.** `auth/spreadsheets` already covers reading a spreadsheet whose ID
+we hold — only the *file listing* under Drive requires more.
+
+### `find_rows_in_tabs( $spreadsheet_id, array $sheet_names, $order_id, $access_token )`
+
+`GET {API_BASE}{id}/values:batchGet?majorDimension=COLUMNS&ranges=…&ranges=…`
+
+`find_rows_by_order_id()` for **many tabs in one request**. Returns
+`tab name => ascending 1-based row numbers`, with tabs where the order is absent **omitted
+entirely**.
+
+Doing this with the single-tab method would cost one request per tab, per order. `batchGet`
+takes many ranges at once, so the whole question costs exactly one request no matter how many
+tabs exist.
+
+Three things to know:
+
+1. **Ranges are appended by hand**, not via `add_query_arg()`, because `batchGet` wants a
+   *repeated* key — `?ranges=A&ranges=B`, not `ranges[]=A`, which `add_query_arg()` cannot
+   express.
+2. **Results are matched back to tabs by POSITION**, not by parsing the `range` string Google
+   echoes back. Google re-quotes and normalises names (`Sheet1!A1:A9` vs `'On hold'!A1:A9`), so
+   string-matching it is fragile. The API documents `valueRanges` as parallel to the ranges
+   requested, which is stable.
+3. **Naming a range on a tab that does not exist fails the ENTIRE request**, taking every other
+   tab's result with it. That is why `Status_Tabs::existing_tab_names()` exists and why callers
+   must filter before searching.
+
+Empty input returns `array()` — nothing to search is not an error. Cell comparison is the same
+trimmed string compare as `find_rows_by_order_id()`, deliberately.
+
+### `create_sheet( $spreadsheet_id, $title, $access_token )`
+
+`POST {API_BASE}{id}:batchUpdate` with an `addSheet` request. Returns the new `sheetId`, so the
+caller can act on it without a second `get_sheet_map()` round trip.
+
+**A duplicate title gets its own error code.** Google's message for a taken name is
+*"A sheet with the name … already exists"*, which is re-coded to **`wtg_sheet_exists`** so the
+caller can treat it as "fine, it already exists" and recover rather than retrying. That race is
+genuinely possible when two cron runs overlap on the first order to reach a given status —
+`Status_Tabs::create()` handles it by re-reading the map.
+
+### `delete_rows( $spreadsheet_id, $sheet_id, array $row_numbers, $access_token )`
+
+`POST {API_BASE}{id}:batchUpdate` with one `deleteDimension` request per row.
+
+**This is the one destructive call in the plugin**, so it is deliberately blunt: explicit row
+numbers, nothing clever. Callers are expected to pass **only** row numbers an order-ID lookup
+just returned — which can never include a header row, since the text "Order ID" does not equal
+an order number.
+
+Three details that are easy to get wrong:
+
+| Detail | Why |
+|---|---|
+| Rows are deleted **highest first** (`rsort`) | Deleting row 3 shifts row 7 up to row 6. Working downwards would make every subsequent number wrong; descending order means the rows still waiting have not moved yet |
+| Ranges are **0-based and half-open** | `deleteDimension` uses `startIndex`/`endIndex`, unlike the 1-based inclusive rows used everywhere else in this class. Row N becomes `startIndex N-1, endIndex N` |
+| Anything `< 1` is dropped, duplicates collapse | A stray `0` would become `startIndex -1` and be rejected — or worse, misread |
+
+Empty input returns `true`. Nothing to do is not an error.
+
+### `batch_update( … )` — private
+
+Shared POST to `{API_BASE}{id}:batchUpdate`, used by `create_sheet()` and `delete_rows()`, with
+the caller supplying the error code.
+
+⚠️ **Do not confuse `spreadsheets:batchUpdate` with `values:batchUpdate`.** This helper is the
+*structural* one — add and delete sheets and rows. `update_rows()` uses the *values* one — write
+cell contents. Same word, different endpoints, different payload shapes, different permissions
+model in your head.
 
 ---
 
@@ -374,9 +469,13 @@ a Disconnect button beside it.
 | `wtg_oauth_error` | `parse_token_response()` | Any other OAuth failure; carries `google_error` |
 | `wtg_bad_token_response` | `parse_token_response()` | Non-JSON reply from Google |
 | `wtg_append_failed` | `append_rows()` | Non-2xx from `values:append` |
-| `wtg_lookup_failed` | `find_rows_by_order_id()` | Non-2xx from the column read |
+| `wtg_lookup_failed` | `find_rows_by_order_id()`, `find_rows_in_tabs()` | Non-2xx from the column read |
 | `wtg_read_failed` | `read_row()` | Non-2xx when reading a row back |
-| `wtg_sheet_list_failed` | `list_sheet_titles()` | Non-2xx when listing a spreadsheet's tabs |
+| `wtg_sheet_list_failed` | `get_sheet_map()`, and so `list_sheet_titles()` | Non-2xx when listing a spreadsheet's tabs |
+| `wtg_create_sheet_failed` | `create_sheet()` | Empty title, non-2xx from `addSheet`, or no `sheetId` in the reply |
+| `wtg_sheet_exists` | `create_sheet()` | The tab name is taken. **Recoverable** — re-read the map and use it |
+| `wtg_delete_rows_failed` | `delete_rows()` | Non-2xx from `deleteDimension` |
+| `wtg_invalid_status_tab` | `Status_Tabs::sheet_id_for()` | Refused: the name is empty or is the master tab |
 | `wtg_drive_scope_missing` | `Drive_Client::list_spreadsheets()` | 401/403 — token predates the Drive scope; reconnect |
 | `wtg_drive_list_failed` | `Drive_Client::list_spreadsheets()` | Any other non-2xx from Drive |
 | `wtg_update_failed` | `update_rows()` | Non-2xx from `values:batchUpdate`, or count mismatch |

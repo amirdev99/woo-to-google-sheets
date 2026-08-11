@@ -7,6 +7,11 @@
  * then marking them failed. This is the ONLY place the Sheets API is called for
  * real order data, deliberately far away from checkout.
  *
+ * When per-status tabs are switched on there is a SECOND phase per order: the
+ * order is also routed onto the one tab matching its current status, and removed
+ * from any other status tab it was previously on. The master tab is unaffected by
+ * that phase — status tabs are in addition to it, never instead of it.
+ *
  * @package WTG
  */
 
@@ -15,6 +20,7 @@ namespace WTG\Queue;
 use WTG\Settings;
 use WTG\Google\OAuth_Client;
 use WTG\Google\Sheets_Client;
+use WTG\Sheets\Status_Tabs;
 use WTG\WooCommerce\Order_Mapper;
 
 // Block direct access.
@@ -72,6 +78,12 @@ class Sync_Processor {
 		$sheets = new Sheets_Client();
 		$mapper = new Order_Mapper();
 
+		// Built ONCE for the whole batch, outside the loop, because the instance
+		// caches the spreadsheet's tab map — twenty orders then cost one map lookup
+		// instead of twenty. Null when the feature is off, which is also the flag
+		// the loop below tests, so a disabled install does no extra work at all.
+		$tabs = Status_Tabs::is_enabled() ? new Status_Tabs( $sheets, $spreadsheet_id, $token ) : null;
+
 		foreach ( $rows as $row ) {
 			$counts['processed']++;
 
@@ -109,6 +121,14 @@ class Sync_Processor {
 				$result = $this->write( $sheets, $spreadsheet_id, $sheet_name, $existing, $new_rows, $token );
 			}
 
+			// Second phase: put the order on the status tab it belongs to now, and
+			// take it off any other. Only after the master write succeeded — if the
+			// master is broken (bad token, deleted spreadsheet) there is no point
+			// spending more requests discovering the same thing again.
+			if ( ! is_wp_error( $result ) && null !== $tabs ) {
+				$result = $this->route( $tabs, $sheets, $spreadsheet_id, $order, $new_rows, $token );
+			}
+
 			if ( is_wp_error( $result ) ) {
 				if ( $attempts >= Sync_Queue::MAX_ATTEMPTS ) {
 					// Out of retries — mark terminally failed (manual Retry resets it).
@@ -130,6 +150,102 @@ class Sync_Processor {
 	}
 
 	/**
+	 * Put an order on the status tab matching its status, and off every other one.
+	 *
+	 * Three steps, in this order for a reason:
+	 *
+	 *  1. ASK where the order currently is — one batchGet across every status tab
+	 *     that exists. Nothing is stored about an order's location, exactly as with
+	 *     the master tab: a sheet is a document humans re-sort and edit, so a
+	 *     remembered tab name would quietly go stale. A lookup always tells the truth.
+	 *  2. WRITE it to the tab it belongs on now (creating that tab, with a header,
+	 *     if this is the first order to reach the status).
+	 *  3. DELETE it from the others.
+	 *
+	 * Write BEFORE delete, never the other way round. If the run dies between the
+	 * two the order appears on two tabs at once — visible, harmless, and healed by
+	 * the next sync. Deleting first and then dying would lose the row outright.
+	 *
+	 * An order whose status has no tab (feature on, but the status is untracked or
+	 * its name clashes with the master tab) skips step 2 and still runs step 3:
+	 * "belongs on no status tab" is a real destination, and the order must not be
+	 * left behind on the tab it used to be on. It stays on the master tab either
+	 * way — nothing here touches that.
+	 *
+	 * @param Status_Tabs               $tabs           Tab resolver for this batch.
+	 * @param \WTG\Google\Sheets_Client $sheets         Client.
+	 * @param string                    $spreadsheet_id Target spreadsheet.
+	 * @param \WC_Order                 $order          The order being synced.
+	 * @param array                     $new_rows       Rows the order needs now.
+	 * @param string                    $token          Access token.
+	 * @return true|\WP_Error
+	 */
+	private function route( Status_Tabs $tabs, $sheets, $spreadsheet_id, $order, array $new_rows, $token ) {
+		// Only tabs that already exist can be searched: a batchGet naming a range on
+		// a missing tab fails the ENTIRE request, taking the other tabs down with it.
+		$searchable = $tabs->existing_tab_names();
+		if ( is_wp_error( $searchable ) ) {
+			return $searchable;
+		}
+
+		// get_status() returns the slug WITHOUT the "wc-" prefix, which is the form
+		// Status_Tabs works in throughout. '' here means "no tab for this status".
+		$target   = Status_Tabs::tab_name_for( $order->get_status() );
+		$order_id = $order->get_id();
+
+		$found = $sheets->find_rows_in_tabs( $spreadsheet_id, $searchable, $order_id, $token );
+		if ( is_wp_error( $found ) ) {
+			// Same rule as the master lookup: a failed search must never fall through
+			// to a blind append, or a transient error would duplicate the order.
+			return $found;
+		}
+
+		if ( '' !== $target ) {
+			// Resolve before writing, because this is what CREATES the tab (and its
+			// header) the first time a status is used. The write below addresses the
+			// tab by name, but without this call the name might not exist yet.
+			$sheet_id = $tabs->sheet_id_for( $target );
+			if ( is_wp_error( $sheet_id ) ) {
+				return $sheet_id;
+			}
+
+			// A tab we just created cannot be in $found — it was not searchable — so
+			// this correctly falls through to an append for a first-time status.
+			$existing = isset( $found[ $target ] ) ? $found[ $target ] : array();
+
+			// Reuse the master reconciler verbatim, so a status tab gets identical
+			// upsert behaviour: overwrite in place, append surplus products, refuse
+			// to guess when products were removed.
+			$result = $this->write( $sheets, $spreadsheet_id, $target, $existing, $new_rows, $token );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+		}
+
+		foreach ( $found as $name => $rows ) {
+			// The target tab was just reconciled in place — it is where the order is
+			// supposed to be, so it is the one tab we must NOT delete from.
+			if ( $name === $target ) {
+				continue;
+			}
+
+			// Deleting addresses a tab by numeric ID, not by name. These tabs came out
+			// of the search so they exist; this is a cached map read, not a request.
+			$sheet_id = $tabs->sheet_id_for( $name );
+			if ( is_wp_error( $sheet_id ) ) {
+				return $sheet_id;
+			}
+
+			$result = $sheets->delete_rows( $spreadsheet_id, $sheet_id, $rows, $token );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+		}
+
+		return true;
+	}
+
+	/**
 	 * Reconcile the rows an order already has in the sheet with the rows it needs.
 	 *
 	 * Three cases, because an order's product list can change after it was synced:
@@ -144,6 +260,10 @@ class Sync_Processor {
 	 * delete is destructive and irreversible, and if the row lookup were ever
 	 * wrong it would take real data with it. Instead we report a clear error so
 	 * the sheet can be corrected by hand.
+	 *
+	 * Note route() DOES delete, but only rows an order-ID lookup just returned, and
+	 * only to move an order between status tabs — never on the master tab, and never
+	 * to reconcile a product count. The two are different decisions.
 	 *
 	 * @param \WTG\Google\Sheets_Client $sheets         Client.
 	 * @param string                    $spreadsheet_id Target spreadsheet.

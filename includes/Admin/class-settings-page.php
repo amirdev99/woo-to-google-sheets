@@ -16,6 +16,8 @@ use WTG\Google\OAuth_Client;
 use WTG\Google\Drive_Client;
 use WTG\Google\Sheets_Client;
 use WTG\Queue\Sync_Queue;
+use WTG\Queue\Sync_Runner;
+use WTG\Sheets\Status_Tabs;
 use WTG\WooCommerce\Order_Mapper;
 
 // Block direct access.
@@ -32,6 +34,18 @@ class Settings_Page {
 	 * The ?page= slug for this admin screen.
 	 */
 	const MENU_SLUG = 'woo-to-google-sheets';
+
+	/**
+	 * Seconds an order may sit unsent before we call the sync stalled.
+	 *
+	 * Ten minutes is deliberately forgiving: the recurring cron runs every five,
+	 * so anything under that is just normal waiting and warning about it would
+	 * train the shop owner to ignore the notice. Only rows that have never been
+	 * attempted count towards this (see Sync_Queue::oldest_pending_age) — a row
+	 * being retried after a Google error is spaced out on purpose, and is a
+	 * different problem, reported per-row in the log.
+	 */
+	const STALLED_AFTER = 600;
 
 	/**
 	 * Where the top-level menu item sits in the admin sidebar.
@@ -100,6 +114,51 @@ class Settings_Page {
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		// Must run before any output, so admin_init rather than during render.
 		add_action( 'admin_init', array( $this, 'maybe_refresh_lists' ) );
+
+		// Deliberately on EVERY admin screen, not just ours. A shop owner who
+		// thinks the plugin is working has no reason to open its settings page —
+		// which is exactly when they most need telling that it is not.
+		add_action( 'admin_notices', array( $this, 'maybe_render_stalled_notice' ) );
+	}
+
+	/**
+	 * Warn, anywhere in wp-admin, when orders are stuck waiting to sync.
+	 *
+	 * Sync_Runner has four independent ways to drain the queue. If an order has
+	 * still been sitting there for STALLED_AFTER seconds, all four failed, and no
+	 * amount of waiting will fix it — so we say so, in the shop owner's language,
+	 * with the one thing that reliably repairs it.
+	 *
+	 * @return void
+	 */
+	public function maybe_render_stalled_notice() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$waiting = Sync_Queue::oldest_pending_age();
+		if ( $waiting < self::STALLED_AFTER ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-warning"><p><strong>%1$s</strong> %2$s</p><p>%3$s</p></div>',
+			esc_html__( 'Woo to Google Sheets:', 'woo-to-gsheet' ),
+			esc_html(
+				sprintf(
+					/* translators: %s: human-readable duration, e.g. "22 mins". */
+					__( 'orders have been waiting %s to reach your spreadsheet. Automatic syncing does not appear to be running on this site.', 'woo-to-gsheet' ),
+					human_time_diff( time() - $waiting, time() )
+				)
+			),
+			wp_kses_post(
+				sprintf(
+					/* translators: %s: link to the Sync Log tab. */
+					__( 'This is almost always your site\'s scheduled tasks (WP-Cron) being blocked — ask your host to confirm loopback requests are allowed, or set up a real server cron job. %s', 'woo-to-gsheet' ),
+					'<a href="' . esc_url( self::url( 'sync_log' ) ) . '">' . esc_html__( 'Open the Sync Log', 'woo-to-gsheet' ) . '</a>'
+				)
+			)
+		);
 	}
 
 	/**
@@ -243,6 +302,10 @@ class Settings_Page {
 			$output = $this->sanitize_fields( $input, $output, $existing );
 		}
 
+		if ( 'status_tabs' === $form ) {
+			$output = $this->sanitize_status_tabs( $input, $output );
+		}
+
 		// CRITICAL: register_setting() runs this callback on EVERY update of the
 		// wtg_settings option — including our own programmatic token writes from
 		// the OAuth flow (store_tokens/disconnect), because it filters
@@ -318,6 +381,86 @@ class Settings_Page {
 				'warning'
 			);
 		}
+
+		return $output;
+	}
+
+	/**
+	 * Sanitize the Status Tabs tab: the switch, the routed statuses, the names.
+	 *
+	 * @param array $input  Raw submitted array.
+	 * @param array $output Output built so far.
+	 * @return array
+	 */
+	private function sanitize_status_tabs( array $input, array $output ) {
+		$enabled = ! empty( $input[ Status_Tabs::SETTING_ENABLED ] );
+
+		$available = Status_Tabs::available_statuses();
+
+		// No WooCommerce, no status list — so the form rendered no rows and there is
+		// nothing to read. Save the switch, but leave the stored selection and names
+		// alone rather than wiping a configuration this request could not even see.
+		if ( empty( $available ) ) {
+			$output[ Status_Tabs::SETTING_ENABLED ] = $enabled;
+
+			return $output;
+		}
+
+		$submitted = ( isset( $input[ Status_Tabs::SETTING_STATUSES ] ) && is_array( $input[ Status_Tabs::SETTING_STATUSES ] ) )
+			? $input[ Status_Tabs::SETTING_STATUSES ]
+			: array();
+
+		// Walk the AVAILABLE list and keep what was ticked, the same direction of
+		// travel as sanitize_fields(): an unknown slug can never be stored, and the
+		// stored order always matches WooCommerce's own.
+		$chosen = array();
+		foreach ( array_keys( $available ) as $slug ) {
+			if ( in_array( $slug, $submitted, true ) ) {
+				$chosen[] = $slug;
+			}
+		}
+
+		if ( empty( $chosen ) ) {
+			// An empty list MEANS "all statuses" to Status_Tabs::tracked_statuses(),
+			// so "none" is not a storable state. A feature that is on but routes
+			// nothing would be a lie in the UI, so untick-everything is read as
+			// "switch it off" — and we say so instead of quietly doing something else.
+			if ( $enabled && function_exists( 'add_settings_error' ) ) {
+				add_settings_error(
+					Settings::OPTION_KEY,
+					'wtg_status_tabs_none',
+					__( 'No order statuses were selected, so per-status tabs have been switched off. Tick at least one status to turn the feature on.', 'woo-to-gsheet' ),
+					'warning'
+				);
+			}
+
+			$enabled = false;
+		}
+
+		$output[ Status_Tabs::SETTING_ENABLED ] = $enabled;
+
+		// Storing "everything is ticked" as an EMPTY array is deliberate: it records
+		// the intent ("all statuses") rather than a snapshot of today's list, so a
+		// status added later by WooCommerce or another plugin gets a tab too.
+		$output[ Status_Tabs::SETTING_STATUSES ] = ( count( $chosen ) === count( $available ) ) ? array() : $chosen;
+
+		// Names: keep ONLY what differs from WooCommerce's own label, so a site that
+		// never renamed a tab follows the label if WooCommerce ever rewords it.
+		$names = array();
+		if ( isset( $input[ Status_Tabs::SETTING_NAMES ] ) && is_array( $input[ Status_Tabs::SETTING_NAMES ] ) ) {
+			foreach ( $available as $slug => $label ) {
+				if ( ! isset( $input[ Status_Tabs::SETTING_NAMES ][ $slug ] ) ) {
+					continue;
+				}
+
+				$value = sanitize_text_field( $input[ Status_Tabs::SETTING_NAMES ][ $slug ] );
+
+				if ( '' !== $value && $value !== $label ) {
+					$names[ $slug ] = $value;
+				}
+			}
+		}
+		$output[ Status_Tabs::SETTING_NAMES ] = $names;
 
 		return $output;
 	}
@@ -759,7 +902,7 @@ class Settings_Page {
 		// Which tab? Only used to switch what we display (no state change), so a
 		// nonce is unnecessary; sanitize_key keeps it to a safe [a-z0-9_] slug.
 		$active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'connection';
-		if ( ! in_array( $active_tab, array( 'connection', 'fields', 'sync_log' ), true ) ) {
+		if ( ! in_array( $active_tab, array( 'connection', 'fields', 'status_tabs', 'sync_log' ), true ) ) {
 			$active_tab = 'connection';
 		}
 
@@ -777,6 +920,10 @@ class Settings_Page {
 					class="nav-tab <?php echo 'fields' === $active_tab ? 'nav-tab-active' : ''; ?>">
 					<?php esc_html_e( 'Fields', 'woo-to-gsheet' ); ?>
 				</a>
+				<a href="<?php echo esc_url( add_query_arg( 'tab', 'status_tabs', $base_url ) ); ?>"
+					class="nav-tab <?php echo 'status_tabs' === $active_tab ? 'nav-tab-active' : ''; ?>">
+					<?php esc_html_e( 'Status Tabs', 'woo-to-gsheet' ); ?>
+				</a>
 				<a href="<?php echo esc_url( add_query_arg( 'tab', 'sync_log', $base_url ) ); ?>"
 					class="nav-tab <?php echo 'sync_log' === $active_tab ? 'nav-tab-active' : ''; ?>">
 					<?php esc_html_e( 'Sync Log', 'woo-to-gsheet' ); ?>
@@ -788,6 +935,8 @@ class Settings_Page {
 				$this->render_sync_log_tab();
 			} elseif ( 'fields' === $active_tab ) {
 				$this->render_fields_tab();
+			} elseif ( 'status_tabs' === $active_tab ) {
+				$this->render_status_tabs_tab();
 			} else {
 				$this->render_connection_tab();
 			}
@@ -958,12 +1107,200 @@ class Settings_Page {
 	}
 
 	/**
+	 * The Status Tabs tab: give each order status its own tab in the spreadsheet.
+	 *
+	 * Hand-rendered for the same reason as the Fields tab — the Settings API is
+	 * awkward for a repeating checklist — and posts to options.php under the same
+	 * registered group, so nonce and capability handling are unchanged.
+	 *
+	 * @return void
+	 */
+	private function render_status_tabs_tab() {
+		settings_errors();
+
+		$enabled   = Status_Tabs::is_enabled();
+		$available = Status_Tabs::available_statuses();
+		$tracked   = Status_Tabs::tracked_statuses();
+		$master    = trim( (string) Settings::get( 'sheet_name', 'Sheet1' ) );
+
+		$names = Settings::get( Status_Tabs::SETTING_NAMES, array() );
+		if ( ! is_array( $names ) ) {
+			$names = array();
+		}
+		?>
+		<p style="max-width:820px;">
+			<?php esc_html_e( 'Give each order status its own tab in the spreadsheet. An order is written to the tab for its current status, and when its status changes the plugin moves the row: it is added to the new tab first, then removed from the old one.', 'woo-to-gsheet' ); ?>
+		</p>
+		<p class="description" style="max-width:820px;">
+			<?php
+			printf(
+				/* translators: %s: the main tab name from the Connection tab. */
+				esc_html__( 'Your main tab (%s) keeps working exactly as it does today — every order still goes there. Status tabs are in addition to it, not instead of it.', 'woo-to-gsheet' ),
+				'<strong>' . esc_html( $master ) . '</strong>' // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped above.
+			);
+			?>
+		</p>
+
+		<?php if ( empty( $available ) ) : ?>
+			<div class="notice notice-warning inline" style="margin:1em 0;max-width:820px;">
+				<p><?php esc_html_e( 'WooCommerce is not active, so the list of order statuses cannot be loaded. Activate WooCommerce to configure this feature.', 'woo-to-gsheet' ); ?></p>
+			</div>
+		<?php endif; ?>
+
+		<form action="options.php" method="post">
+			<?php
+			settings_fields( self::SETTINGS_GROUP );
+			printf(
+				'<input type="hidden" name="%1$s[%2$s]" value="status_tabs" />',
+				esc_attr( Settings::OPTION_KEY ),
+				esc_attr( self::FORM_MARKER )
+			);
+			?>
+
+			<p style="margin-top:1.5em;">
+				<label>
+					<input type="checkbox"
+						name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[<?php echo esc_attr( Status_Tabs::SETTING_ENABLED ); ?>]"
+						value="1"
+						<?php checked( $enabled ); ?> />
+					<strong><?php esc_html_e( 'Write orders to a tab per order status', 'woo-to-gsheet' ); ?></strong>
+				</label>
+			</p>
+
+			<?php if ( ! empty( $available ) ) : ?>
+				<table class="widefat striped" style="max-width:820px;margin-top:1em;">
+					<thead>
+						<tr>
+							<th style="width:90px;"><?php esc_html_e( 'Include', 'woo-to-gsheet' ); ?></th>
+							<th><?php esc_html_e( 'Order status', 'woo-to-gsheet' ); ?></th>
+							<th><?php esc_html_e( 'Tab name', 'woo-to-gsheet' ); ?></th>
+						</tr>
+					</thead>
+					<tbody>
+					<?php
+					foreach ( $available as $slug => $label ) :
+						$is_on = in_array( $slug, $tracked, true );
+
+						// What the tab would actually be called: the admin's override if
+						// they set one, otherwise WooCommerce's own label. The input is
+						// left EMPTY when there is no override, so the placeholder shows
+						// the default and clearing the box means "go back to the default".
+						$override  = isset( $names[ $slug ] ) ? (string) $names[ $slug ] : '';
+						$effective = '' !== trim( $override ) ? trim( $override ) : $label;
+
+						// Same case-insensitive comparison Status_Tabs uses to protect the
+						// master tab. This row is why the check is worth surfacing: the
+						// sync silently refuses such a name, and without this note the
+						// admin would just see a tab that never appears.
+						$clashes = ( '' !== $master && 0 === strcasecmp( $effective, $master ) );
+						?>
+						<tr>
+							<td>
+								<input type="checkbox"
+									id="wtg_status_tab_<?php echo esc_attr( $slug ); ?>"
+									name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[<?php echo esc_attr( Status_Tabs::SETTING_STATUSES ); ?>][]"
+									value="<?php echo esc_attr( $slug ); ?>"
+									<?php checked( $is_on ); ?> />
+							</td>
+							<td>
+								<label for="wtg_status_tab_<?php echo esc_attr( $slug ); ?>">
+									<?php echo esc_html( $label ); ?>
+								</label>
+								<code style="margin-left:.5em;"><?php echo esc_html( $slug ); ?></code>
+							</td>
+							<td>
+								<input type="text"
+									name="<?php echo esc_attr( Settings::OPTION_KEY ); ?>[<?php echo esc_attr( Status_Tabs::SETTING_NAMES ); ?>][<?php echo esc_attr( $slug ); ?>]"
+									value="<?php echo esc_attr( $override ); ?>"
+									class="regular-text"
+									placeholder="<?php echo esc_attr( $label ); ?>" />
+								<?php if ( $clashes ) : ?>
+									<p class="description" style="color:#b32d2e;margin-bottom:0;">
+										<?php
+										printf(
+											/* translators: %s: the main tab name. */
+											esc_html__( 'This is the same as your main tab (%s), so this status will not get a tab — its orders stay on the main tab only. Choose a different name.', 'woo-to-gsheet' ),
+											esc_html( $master )
+										);
+										?>
+									</p>
+								<?php endif; ?>
+							</td>
+						</tr>
+					<?php endforeach; ?>
+					</tbody>
+				</table>
+
+				<p class="description" style="margin-top:1em;max-width:820px;">
+					<?php esc_html_e( 'Leave a tab name blank to use WooCommerce\'s own wording for that status. Tabs are created in your spreadsheet the first time an order reaches that status — nothing is created just by saving this page.', 'woo-to-gsheet' ); ?>
+				</p>
+				<p class="description" style="max-width:820px;">
+					<?php esc_html_e( 'With every status ticked, any new status added later by WooCommerce or another plugin gets a tab automatically. Untick them all to switch the feature off.', 'woo-to-gsheet' ); ?>
+				</p>
+				<p class="description" style="max-width:820px;">
+					<?php esc_html_e( 'Draft and trashed orders are not listed, because they are never synced to the sheet in the first place.', 'woo-to-gsheet' ); ?>
+				</p>
+			<?php endif; ?>
+
+			<?php submit_button(); ?>
+		</form>
+		<?php
+	}
+
+	/**
+	 * The "is this thing on?" panel at the top of the Sync Log.
+	 *
+	 * The counts below it say what happened to orders. This says whether the
+	 * automation itself is running — which is the question a shop owner actually
+	 * has, and the one that used to be unanswerable without pressing Process
+	 * Queue Now and seeing whether anything moved.
+	 *
+	 * @return void
+	 */
+	private function render_sync_health() {
+		$last    = Sync_Runner::last_run();
+		$waiting = Sync_Queue::oldest_pending_age();
+
+		if ( $waiting >= self::STALLED_AFTER ) {
+			// The full explanation is already on screen via the admin notice, so
+			// this stays short and does not repeat it.
+			$state = 'notice-error';
+			$text  = sprintf(
+				/* translators: %s: human-readable duration. */
+				__( 'Stalled — the oldest order has been waiting %s.', 'woo-to-gsheet' ),
+				human_time_diff( time() - $waiting, time() )
+			);
+		} elseif ( $last > 0 ) {
+			$text = sprintf(
+				/* translators: %s: human-readable duration, e.g. "3 mins". */
+				__( 'Running normally. Last automatic sync: %s ago.', 'woo-to-gsheet' ),
+				human_time_diff( $last, time() )
+			);
+
+			$state = 'notice-success';
+		} else {
+			// No run has ever completed. Not an error on a fresh install — there
+			// may simply have been no orders yet — so this is neutral, not alarming.
+			$state = 'notice-info';
+			$text  = __( 'No automatic sync has run yet. It starts by itself as soon as an order is placed or changes status.', 'woo-to-gsheet' );
+		}
+
+		printf(
+			'<div class="notice %1$s inline" style="margin:1em 0;"><p>%2$s</p></div>',
+			esc_attr( $state ),
+			esc_html( $text )
+		);
+	}
+
+	/**
 	 * The Sync Log tab: placeholder until Phase 6.
 	 *
 	 * @return void
 	 */
 	private function render_sync_log_tab() {
 		settings_errors();
+
+		$this->render_sync_health();
 
 		// Status summary + manual trigger.
 		// One query for all four counts.

@@ -4,7 +4,7 @@ Every configuration value the plugin stores, where it comes from, and who reads 
 
 ## The storage rule
 
-All plugin settings live in **one** option, `wtg_settings`, holding an array of eight keys.
+All plugin settings live in **one** option, `wtg_settings`, holding an array of thirteen keys.
 `includes/class-settings.php` is the only file that calls `get_option()` / `update_option()`
 for it — nothing else touches WordPress options directly.
 
@@ -13,7 +13,7 @@ Defaults come from `Settings::defaults()`, merged over stored values by `wp_pars
 
 ---
 
-## `wtg_settings` — the eight keys
+## `wtg_settings` — the thirteen keys
 
 ### User-entered (the Connection tab form)
 
@@ -69,6 +69,35 @@ this list, so a scrambled or stale value cannot produce scrambled columns.
 label is improved in a future version, columns the user never renamed pick up the new wording
 automatically.
 
+### Per-status tabs (the Status Tabs tab)
+
+| Key | Default | Type | Written by | Read by |
+|---|---|---|---|---|
+| `status_tabs_enabled` | `false` | bool | `Settings_Page::sanitize_status_tabs()` | `Status_Tabs::is_enabled()`, and so `Sync_Processor::process()` |
+| `status_tab_statuses` | `array()` | list of status slugs | `Settings_Page::sanitize_status_tabs()` | `Status_Tabs::tracked_statuses()` |
+| `status_tab_names` | `array()` | slug => name map | `Settings_Page::sanitize_status_tabs()` | `Status_Tabs::raw_name_for()` |
+
+The keys are declared as constants on `Status_Tabs` (`SETTING_ENABLED`, `SETTING_STATUSES`,
+`SETTING_NAMES`) so the settings page, the sanitizer and the readers cannot drift apart.
+
+**`status_tabs_enabled`** — defaults to **false**, so upgrading changes nothing: no tabs appear,
+no rows move, and `Sync_Processor` makes not one extra request. See `11-status-tabs.md`.
+
+**`status_tab_statuses`** — **an empty array means "all statuses"**, exactly as `fields` does,
+and for the same reason: it records the intent rather than a snapshot, so a status added later
+by WooCommerce or another plugin is routed too. That also makes *"none"* unstorable, which is
+why unticking everything switches the feature off instead (with a warning).
+
+Slugs are stored **without** the `wc-` prefix — the form `WC_Order::get_status()` returns.
+`tracked_statuses()` walks the available list and filters by this one, so a stale slug left by a
+removed plugin is ignored rather than acted on.
+
+**`status_tab_names`** — only names that **differ from WooCommerce's own label** are stored, so
+a status the admin never renamed follows the label if WooCommerce rewords it. A name matching
+`sheet_name` (case-insensitively) is stored but **never used** — `Status_Tabs::tab_name_for()`
+refuses it, because the move logic deletes rows from every tab that is not the target and must
+never be pointed at the master tab. The settings screen flags such a row in red.
+
 ### Written only by the OAuth flow
 
 These four have **no form fields**. They are written exclusively by `OAuth_Client`.
@@ -115,10 +144,10 @@ it will be silently stripped every time it is saved.
 
 ### ⚠️ The form marker
 
-There are **two** forms writing this option — the Connection tab and the Fields tab — and an
-unchecked checkbox is simply not submitted. Without a way to tell the forms apart, saving the
-Connection tab would be indistinguishable from "the user unticked every field", and would wipe
-the column selection.
+There are **three** forms writing this option — the Connection tab, the Fields tab and the
+Status Tabs tab — and an unchecked checkbox is simply not submitted. Without a way to tell the
+forms apart, saving the Connection tab would be indistinguishable from "the user unticked every
+field", and would wipe the column selection.
 
 So each form posts a hidden `wtg_settings[_form]` value (`Settings_Page::FORM_MARKER`), and
 `sanitize()` only touches the keys belonging to the form that was submitted:
@@ -127,11 +156,12 @@ So each form posts a hidden `wtg_settings[_form]` value (`Settings_Page::FORM_MA
 |---|---|
 | `connection` | `client_id`, `client_secret`, `spreadsheet_id`, `sheet_name` |
 | `fields` | `fields`, `field_labels` |
+| `status_tabs` | `status_tabs_enabled`, `status_tab_statuses`, `status_tab_names` |
 | absent — programmatic token writes | nothing user-facing; only the passthrough loop above runs |
 
 `_form` is never copied into `$output`, so it is never persisted.
 
-**If you add a third form, give it its own marker value and its own branch in `sanitize()`.**
+**If you add a fourth form, give it its own marker value and its own branch in `sanitize()`.**
 
 ### Not stored: `redirect_uri`
 
@@ -201,3 +231,5 @@ SELECT option_value FROM wp_options WHERE option_name = 'wtg_db_version';
 | `reauth_needed` is `true` | Refresh token died — Google returned `invalid_grant`. Reconnect |
 | `token_expires` in the past | Normal. The next `get_valid_access_token()` refreshes automatically |
 | `wtg_db_version` present, `wtg_settings` absent | Plugin activated but never configured |
+| `status_tabs_enabled` true, `status_tab_statuses` is `[]` | Normal — empty means **all** statuses, not none |
+| A status tab never appears in the sheet | Its name matches `sheet_name`, or the status is not in `status_tab_statuses`. Tabs are also only created when an order actually reaches that status |
