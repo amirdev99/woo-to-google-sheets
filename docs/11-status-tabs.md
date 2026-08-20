@@ -234,9 +234,11 @@ success in disguise — so `create()` clears its cache, re-reads the map, and us
 winner made.
 
 **A failed header write is deliberately ignored.** The tab exists and the order data still
-belongs in it; a missing header is cosmetic and fixable from the settings page. Failing the whole
-sync over a heading would be worse. The header comes from `Order_Mapper::header()`, so status
-tabs match the master tab's column layout and the Write Header Row button.
+belongs in it; a missing header is cosmetic, and the next save on the settings page rewrites
+row 1 of every existing tab — this one included — via `OAuth_Controller::write_header_row()`.
+Failing the whole sync over a heading would be worse. The header comes from
+`Order_Mapper::header()`, so status tabs match the master tab's column layout, and a later
+column change updates every tab's row 1 in a single batched write.
 
 ---
 

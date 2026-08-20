@@ -190,7 +190,7 @@ into `token_expires` (an absolute timestamp, easier to compare later), and write
 **Purpose.** Operations against the Sheets API v4, in two families:
 
 - **`values` endpoints** — the upsert: append new rows, find an order's existing rows, overwrite
-  rows in place, plus reading a row back for the Write Header Row button.
+  rows in place, plus reading a row back before the header row is written.
 - **structural endpoints** — added for per-status tabs: map the tabs, search several tabs at
   once, create a tab, delete rows.
 
@@ -248,7 +248,7 @@ Returns an ascending list of **1-based** row numbers (`$index + 1`).
 
 `GET {API_BASE}{id}/values/{sheet}!1:1`
 
-Reads one whole row back. Used by the **Write Header Row** button, which must tell an empty
+Reads one whole row back. Used by the header write, which must tell an empty
 row from an existing header from real order data before it writes anything.
 
 The range is `1:1` rather than `A1:L1` deliberately — it reads the entire row without this
@@ -258,6 +258,20 @@ independent of the mapper.
 Returns the cell values left to right, or an empty array when the row is blank (Google omits
 `values` entirely for an empty range — the same case `find_rows_by_order_id()` handles).
 
+### `read_row_in_tabs( $spreadsheet_id, array $sheet_names, $row_number, $access_token )`
+
+`GET {API_BASE}{id}/values:batchGet?ranges='Tab A'!1:1&ranges='Tab B'!1:1`
+
+The multi-tab twin of `read_row()`. With per-status tabs on, the header write has to inspect
+row 1 in every tab it writes to, and one request per tab would be wasteful — this asks once.
+
+Google returns `valueRanges` in the order the ranges were requested (the same guarantee
+`find_rows_in_tabs()` relies on), so answers are matched back to their tab by position and
+returned **keyed by tab name**, which is what callers actually want.
+
+Every named tab must exist: a range naming a missing tab fails the *whole* request. That is why
+`OAuth_Controller::header_tabs()` filters to existing tabs before calling this.
+
 ### `update_rows( $spreadsheet_id, $sheet_name, array $row_numbers, array $rows, $access_token )`
 
 `POST {API_BASE}{id}/values:batchUpdate`
@@ -266,7 +280,7 @@ Returns the cell values left to right, or an empty array when the row is blank (
 adjacent (because someone sorted the sheet) still updates correctly, and the whole order
 costs exactly one request.
 
-Each entry names its own bounded range, built by `sprintf`:
+Each entry names its own bounded range, built by the private `row_range()` helper:
 
 ```
 'Sheet1'!A7:L7
@@ -284,7 +298,22 @@ slowly drifting from WooCommerce.
 Guards: returns `true` for empty input; returns `WP_Error` if `$row_numbers` and `$rows` are
 different lengths (a programming error, caught early).
 
+### `update_row_in_tabs( $spreadsheet_id, array $values_by_sheet, $row_number, $access_token )`
+
+`POST {API_BASE}{id}/values:batchUpdate`
+
+The multi-tab twin of `update_rows()`: writes the same row number in many tabs in one request,
+taking tab name => values. Used for the header row, so a column change costs one write no matter
+how many status tabs exist. A tab mapped to an empty value list is skipped, not an error.
+
+Both this and `update_rows()` build their ranges through the private `row_range()` helper, so
+the two cannot disagree about what "one row" spans.
+
 ### Private helpers
+
+**`row_range( $sheet_name, $row_number, $width )`** — the bounded A1 range for one whole row of
+`$width` columns in a tab (`'Sheet1'!A7:L7`). Shared by `update_rows()` and
+`update_row_in_tabs()` so the two cannot disagree about what "one row" spans.
 
 **`normalize_rows( array $rows )`** — runs `array_values()` over each row. A row array with
 non-sequential keys would serialize to a JSON **object** (`{"0":…,"2":…}`) instead of an

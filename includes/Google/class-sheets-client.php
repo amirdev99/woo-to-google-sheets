@@ -506,20 +506,11 @@ class Sheets_Client {
 			);
 		}
 
-		// One entry per row, each naming its own bounded range. Bounding the range
-		// to exactly the columns we write (e.g. A7:L7) means we can never clobber
-		// extra columns a user added to the right of our data.
+		// One entry per row, each naming its own bounded range — see row_range().
 		$data = array();
 		foreach ( $rows as $i => $values ) {
 			$data[] = array(
-				'range'  => sprintf(
-					'%s!%s%d:%s%d',
-					$this->a1_sheet( $sheet_name ),
-					self::ORDER_ID_COLUMN,
-					(int) $row_numbers[ $i ],
-					$this->column_letter( count( $values ) - 1 ),
-					(int) $row_numbers[ $i ]
-				),
+				'range'  => $this->row_range( $sheet_name, (int) $row_numbers[ $i ], count( $values ) ),
 				'values' => array( $values ),
 			);
 		}
@@ -538,6 +529,136 @@ class Sheets_Client {
 
 		$response = wp_remote_post(
 			$url,
+			array(
+				'timeout' => 20,
+				'headers' => array(
+					'Authorization' => 'Bearer ' . $access_token,
+					'Content-Type'  => 'application/json',
+				),
+				'body'    => $body,
+			)
+		);
+
+		$error = $this->response_error( $response, 'wtg_update_failed' );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Read the SAME row number from several tabs in one request.
+	 *
+	 * The multi-tab twin of read_row(), used before writing the header row: with
+	 * per-status tabs switched on, row 1 has to be inspected in every tab the
+	 * plugin writes to, and asking one tab at a time would cost a request each.
+	 *
+	 * Google returns valueRanges in the order the ranges were requested — the
+	 * same guarantee find_rows_in_tabs() already relies on — so the answers are
+	 * matched back to their tab by position and returned keyed by tab NAME, which
+	 * is what every caller actually wants to work with.
+	 *
+	 * @param string   $spreadsheet_id Target spreadsheet.
+	 * @param string[] $sheet_names    Tabs to read. Must all exist: a range on a
+	 *                                 missing tab fails the whole batch.
+	 * @param int      $row_number     1-based row to read from each tab.
+	 * @param string   $access_token   Valid OAuth access token.
+	 * @return array|\WP_Error Tab name => cell values (empty array for a blank row).
+	 */
+	public function read_row_in_tabs( $spreadsheet_id, array $sheet_names, $row_number, $access_token ) {
+		$sheet_names = array_values( $sheet_names );
+
+		if ( empty( $sheet_names ) ) {
+			return array(); // Nothing to read is not an error.
+		}
+
+		$row_number = max( 1, (int) $row_number );
+
+		// add_query_arg cannot express a repeated key, so the ranges are appended
+		// by hand — batchGet wants ?ranges=A&ranges=B, not ranges[]=A.
+		$query = array();
+		foreach ( $sheet_names as $name ) {
+			$range   = $this->a1_sheet( $name ) . '!' . $row_number . ':' . $row_number;
+			$query[] = 'ranges=' . rawurlencode( $range );
+		}
+
+		$url = self::API_BASE . rawurlencode( $spreadsheet_id ) . '/values:batchGet?' . implode( '&', $query );
+
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout' => 20,
+				'headers' => array( 'Authorization' => 'Bearer ' . $access_token ),
+			)
+		);
+
+		$error = $this->response_error( $response, 'wtg_read_failed' );
+		if ( is_wp_error( $error ) ) {
+			return $error;
+		}
+
+		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+		$ranges = isset( $data['valueRanges'] ) && is_array( $data['valueRanges'] ) ? $data['valueRanges'] : array();
+
+		$out = array();
+		foreach ( $sheet_names as $i => $name ) {
+			// Google omits "values" entirely for a blank range — an empty row, not
+			// an error. Same case read_row() handles.
+			$out[ $name ] = ( isset( $ranges[ $i ]['values'][0] ) && is_array( $ranges[ $i ]['values'][0] ) )
+				? $ranges[ $i ]['values'][0]
+				: array();
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Write the SAME row number in several tabs in one request.
+	 *
+	 * The multi-tab twin of update_rows(). Each tab gets its own bounded range,
+	 * exactly as update_rows() builds them, so columns to the right of our data
+	 * are never clobbered — see row_range().
+	 *
+	 * @param string $spreadsheet_id  Target spreadsheet.
+	 * @param array  $values_by_sheet Tab name => the row of values to write there.
+	 * @param int    $row_number      1-based row to overwrite in each tab.
+	 * @param string $access_token    Valid OAuth access token.
+	 * @return true|\WP_Error
+	 */
+	public function update_row_in_tabs( $spreadsheet_id, array $values_by_sheet, $row_number, $access_token ) {
+		$row_number = max( 1, (int) $row_number );
+
+		$data = array();
+		foreach ( $values_by_sheet as $sheet_name => $values ) {
+			if ( ! is_array( $values ) || empty( $values ) ) {
+				continue; // A tab with nothing to write is skipped, not an error.
+			}
+
+			$values = array_values( $values );
+
+			$data[] = array(
+				'range'  => $this->row_range( $sheet_name, $row_number, count( $values ) ),
+				'values' => array( $values ),
+			);
+		}
+
+		if ( empty( $data ) ) {
+			return true; // Nothing to do is not an error.
+		}
+
+		$body = $this->encode(
+			array(
+				'valueInputOption' => 'USER_ENTERED',
+				'data'             => $data,
+			)
+		);
+		if ( is_wp_error( $body ) ) {
+			return $body;
+		}
+
+		$response = wp_remote_post(
+			self::API_BASE . rawurlencode( $spreadsheet_id ) . '/values:batchUpdate',
 			array(
 				'timeout' => 20,
 				'headers' => array(
@@ -691,6 +812,30 @@ class Sheets_Client {
 	 */
 	private function a1_sheet( $sheet_name ) {
 		return "'" . str_replace( "'", "''", (string) $sheet_name ) . "'";
+	}
+
+	/**
+	 * The bounded A1 range for one whole row of $width columns in a tab.
+	 *
+	 * Bounding the range to exactly the columns we write (e.g. 'Sheet1'!A7:L7)
+	 * means we can never clobber extra columns a user added to the right of our
+	 * data. Shared by update_rows() and update_row_in_tabs() so the two cannot
+	 * disagree about what "one row" spans.
+	 *
+	 * @param string $sheet_name Tab name.
+	 * @param int    $row_number 1-based row.
+	 * @param int    $width      Number of columns being written.
+	 * @return string
+	 */
+	private function row_range( $sheet_name, $row_number, $width ) {
+		return sprintf(
+			'%s!%s%d:%s%d',
+			$this->a1_sheet( $sheet_name ),
+			self::ORDER_ID_COLUMN,
+			(int) $row_number,
+			$this->column_letter( max( 0, (int) $width - 1 ) ),
+			(int) $row_number
+		);
 	}
 
 	/**

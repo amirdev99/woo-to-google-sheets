@@ -83,7 +83,7 @@ ever touch an order, and they do it through WooCommerce's own API rather than th
   `use` statements at the top of `class-order-listener.php`. `Order_Mapper` imports
   `WTG\Settings`, because the user chooses which columns to write on the Fields tab.
 - **Depended on by:** `Queue\Sync_Processor` calls `Order_Mapper::map()`,
-  `Admin\OAuth_Controller` calls `Order_Mapper::header()` for the Write Header Row button,
+  `AdminOAuth_Controller` calls `Order_Mapper::header()` when it writes the header row,
   and `Admin\Settings_Page` calls `Order_Mapper::fields()` / `is_locked()` to render the
   Fields checklist. Nothing calls `Order_Listener` directly — WordPress invokes it via hooks.
 

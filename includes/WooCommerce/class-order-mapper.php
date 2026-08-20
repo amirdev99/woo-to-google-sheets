@@ -172,7 +172,7 @@ class Order_Mapper {
 	/**
 	 * The column headings for the selected fields, user overrides applied.
 	 *
-	 * Used by the "Write Header Row" button, which is why the sheet's header can
+	 * Used when the header row is written, which is why the sheet's header can
 	 * never disagree with the data written under it — both come from here.
 	 *
 	 * @return array

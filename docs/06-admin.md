@@ -46,6 +46,7 @@ namespace.
 | `SETTINGS_GROUP` | `wtg_settings_group` | Must match between `register_setting()` and `settings_fields()` |
 | `CONNECTION_SECTION` | `wtg_connection_section` | The Settings-API section on the Connection tab |
 | `FORM_MARKER` | `_form` | Hidden input telling `sanitize()` which form was submitted |
+| `HEADER_WRITE_FLAG` | `wtg_write_header_` | Per-user transient prefix: "this save wants the header row rewritten" — set by the Fields tab only |
 
 There are **three tabs**: `connection`, `fields`, `sync_log`. `render_page()` validates
 `$_GET['tab']` against exactly that list.
@@ -56,6 +57,9 @@ There are **three tabs**: `connection`, `fields`, `sync_log`. `render_page()` va
 |---|---|
 | `admin_menu` | `add_menu()` |
 | `admin_init` | `register_settings()` |
+| `admin_init` | `maybe_refresh_lists()` |
+| `admin_init` | `maybe_write_header_row()` |
+| `admin_notices` | `maybe_render_stalled_notice()` |
 
 ### `add_menu()`
 
@@ -106,6 +110,17 @@ Then the field-specific rules:
 - `sheet_name` — falls back to `'Sheet1'` if cleared, so the processor always has a target.
 - `client_secret` — **a blank submission means "keep the existing secret"**, not "erase it".
   The field renders blank for security, so blank cannot mean deletion.
+
+Saving this tab **never writes to the sheet.** If `spreadsheet_id` or `sheet_name` actually
+changed, row 1 of the new target almost certainly does not match the selected columns, so the
+branch sets `$output['header_needs_write'] = true` — the flag behind the amber "Header row out
+of date" notice and its recovery link on this same panel. The header row belongs to the Fields
+tab's Save button, the one place the user is looking at the column layout; rotating a client
+secret must not reach into a spreadsheet on its own.
+
+The flag is set **on `$output`**, not through `Settings::set()`: we are inside
+`sanitize_option_wtg_settings`, and `Settings::set()` would re-enter `update_option()` on the
+option currently being written.
 
 And then the part that is genuinely surprising:
 
@@ -158,11 +173,49 @@ Handles the Fields tab. Three things worth noting:
 3. It stores **only labels that differ from the default**, so improved default wording in a
    future version reaches columns the user never renamed.
 
-If the selection actually changed it raises an `add_settings_error()` warning telling the user
-to click Write Header Row, and that rows already in the sheet keep the old layout. That call is
-guarded with `function_exists()` — `add_settings_error()` lives in
-`wp-admin/includes/template.php`, which is not loaded on every request, and `sanitize()` can
-run from any context including the OAuth callback on `admin-post.php`.
+Every save of this tab calls `request_header_write()` — **not only saves that changed
+something**. "Press Save and the sheet matches" is the whole promise made by dropping the Write
+Header Row button, and it has to hold on the second press too: a header can be wrong for
+reasons this form never sees (someone edited row 1 in Google Sheets, an earlier write failed).
+An unnecessary ask is cheap, because the write reads row 1 first and does nothing, silently,
+when it already matches.
+
+> **Why not `update_option_{$option}`?** That was the first design, and it was wrong.
+> `update_option()` fires **nothing at all** when the submitted values match what is already
+> stored — so pressing Save a second time did nothing, which is exactly when someone whose
+> sheet header is wrong presses it. The flag is a transient instead, checked on the next page
+> load, so it is independent of whether the option value changed.
+
+`sanitize()` itself stays free of HTTP calls: it runs before the option is stored and from any
+context including the OAuth callback on `admin-post.php`, where a failed Google call must never
+be able to fail a settings save. Setting a transient is the only side effect it has.
+
+### `request_header_write()` — private
+
+`set_transient( HEADER_WRITE_FLAG . get_current_user_id(), 1, MINUTE_IN_SECONDS )`. Per user,
+short-lived, and consumed by the very next admin page load — which is the redirect back from
+`options.php`.
+
+### `maybe_write_header_row()`
+
+Hooked to `admin_init`. Rewrites row 1 of every tab the plugin writes to on the page load after
+a **Fields tab** save — which is why there is no "Write Header Row" button any more. The
+Connection and Status Tabs forms never set the flag, so their Save buttons cost no API call.
+
+| Situation | Behaviour |
+|---|---|
+| No flag transient | Returns immediately — ordinary admin page loads cost no API call |
+| Not connected, or no `spreadsheet_id` | Stores `header_needs_write = true` and returns quietly; a half-configured site should not be shown a Google error for a step it has not reached |
+| Every tab already matched | Silent — "already up to date" on every save is notice noise |
+| Written | Success notice naming the column count, and the tab count when more than one |
+| Failed or refused | Error notice opening with "Your settings were saved, but…" and naming the tabs it could not fix |
+
+Notices go through `OAuth_Controller::set_notice()` (the one-shot transient) rather than
+`add_settings_error()`, because this runs on a normal page load, after the Settings API has
+already flushed its own notices for the save.
+
+The flag is deleted **before** the Google call, so a call that dies mid-request cannot leave a
+flag that retries the same failing call on every admin page load.
 
 ### `sanitize_status_tabs( $input, $output )` — private
 
@@ -335,7 +388,7 @@ Decides which buttons to show, based on `OAuth_Client` state only:
 
 | State | Shown |
 |---|---|
-| `is_connected()` | Green "Connected", **Test Connection**, **Write Header Row**, **Disconnect** |
+| `is_connected()` | Green "Connected", **Test Connection**, **Disconnect** |
 | `has_credentials()` but not connected | Red "Not connected", **Connect Google Account** |
 | Neither | Red "Not connected" plus instructions to save credentials first |
 
@@ -359,6 +412,7 @@ notices.
 | `ACTION_DISCONNECT` | `wtg_oauth_disconnect` |
 | `ACTION_TEST` | `wtg_test_connection` |
 | `ACTION_WRITE_HEADER` | `wtg_write_header` |
+| `HEADER_UP_TO_DATE` | `up_to_date` (a `write_header_row()` return value, not an action) |
 | `STATE_ACTION` | `wtg_oauth_state` |
 | `SHEETS_API` | `https://sheets.googleapis.com/v4/spreadsheets/` |
 
@@ -406,6 +460,10 @@ order:
 
 Only then does it call `exchange_code()`, set a success or error notice, and redirect.
 
+On success it also checks `header_needs_write`: a column change made while disconnected left
+the sheet's header unwritten, and now that there is a token it finishes that job and says so in
+the same notice, rather than leaving the user to find the recovery link.
+
 ### `handle_disconnect()`
 `authorize()`, `OAuth_Client::disconnect()`, success notice, redirect.
 
@@ -418,28 +476,72 @@ permissions all work.
 
 ### `handle_write_header()`
 
-Writes the column labels into row 1. The labels come from `Order_Mapper::header()` — the same
-source the sync uses for data rows — so the header can never disagree with what sits beneath it.
+A thin wrapper: it authorizes, calls `write_header_row()`, turns the result into a notice via
+`describe_header_result()`, and redirects. It is the **recovery** path only — the settings page
+writes the header automatically on a Fields tab save (`Settings_Page::maybe_write_header_row()`), and the
+link that reaches this handler appears on the Connection tab only while
+`header_needs_write` is true.
 
-Row 1 may already hold something, so it reads it first via `Sheets_Client::read_row()` and
-branches four ways:
+### `write_header_row()` — public static
 
-| Row 1 holds | Action |
+Brings row 1 of **every tab the plugin writes order rows into** in line with the current
+columns — the master tab plus each per-status tab that already exists. The labels come from
+`Order_Mapper::header()`, the same source the sync uses for data rows, so a header can never
+disagree with what sits beneath it.
+
+It owns the `header_needs_write` setting: a `WP_Error` sets it, any success clears it, and that
+flag is the single thing deciding whether the Connection tab shows the manual link. The option
+is only touched when the flag actually flips, since this can run inside an `update_option` hook.
+`attempt_header_write()` is the private half doing the work without that bookkeeping.
+
+**Return values** — three shapes, which `describe_header_result()` turns into notices:
+
+| Return | Meaning |
 |---|---|
-| Nothing | Write the header |
-| Exactly this header | Do nothing, report success — clicking twice is safe |
-| A different or older header | Overwrite it |
-| **Order data** | **Refuse**, and tell the user to insert a blank row first |
+| `array( 'columns' => int, 'tabs' => int )` | Written. `tabs` is how many tabs actually needed it |
+| `HEADER_UP_TO_DATE` | Every tab already matched — callers stay silent |
+| `WP_Error` | Nothing written, or some tabs written and at least one refused |
+
+### `attempt_header_write()` — private static
+
+The sweep itself. At most **three requests regardless of tab count**: the tab map (only when
+status tabs are on), one `read_row_in_tabs()`, one `update_row_in_tabs()`.
+
+Each tab is judged **independently** against its own row 1:
+
+| Row 1 holds | Action for that tab |
+|---|---|
+| Nothing | Include it in the write |
+| Exactly this header | Skip it — nothing to do |
+| A different or older header | Overwrite it; that is the whole point |
+| **Order data** | Refuse *that tab only* |
 
 It tells order data from a header by checking whether **A1 is numeric**. Column A is always
 Order ID, so a number means a synced order and text means a header. Refusing there matches how
 `Sync_Processor::write()` refuses rather than deleting rows.
 
-The write itself reuses `Sheets_Client::update_rows()` with row number `1` — no new write path
-exists for the header.
+Refusals are collected and reported **after** the write, so the tabs that *could* be fixed
+already are. Aborting the sweep because one tab is unusable would leave the user unable to fix
+any of them.
 
-`header_matches()` is the private helper comparing trimmed strings; a differing cell count is
-simply "not a match", which handles Google trimming trailing empty cells.
+### `header_tabs( $sheets, $spreadsheet_id, $token )` — private static
+
+The master tab (`sheet_name`) plus `Status_Tabs::existing_tab_names()` when per-status tabs are
+enabled. Two deliberate choices:
+
+- **Only tabs that already exist.** A range naming a missing tab fails the *entire* batched
+  request, and a tab created later gets its header from `Status_Tabs::create()` anyway.
+- **A failed tab-map read degrades to the master tab** rather than aborting. Fixing the tab the
+  shop owner is actually looking at beats fixing nothing.
+
+`Status_Tabs::tab_names()` already excludes the master tab, so no de-duplication is needed.
+
+`header_matches()` is the private static helper comparing trimmed strings; a differing cell
+count is simply "not a match", which handles Google trimming trailing empty cells.
+`describe_header_result()` maps a return value onto a notice type and message, so the manual
+button and the automatic save cannot drift apart in what they tell the user. It names the tab
+count only when more than one tab was written — on a single-tab site that number would just be
+a confusing extra.
 
 ### `fetch_spreadsheet_title( $token, $spreadsheet_id )` — private
 
@@ -455,7 +557,11 @@ A small read-only `GET {SHEETS_API}{id}?fields=properties.title`.
 Capability check plus `check_admin_referer( $action )`, which `wp_die()`s on a bad nonce.
 Shared by connect, disconnect and test — but **not** by the callback, which uses `state`.
 
-### `set_notice()` / `render_notice()`
+### `set_notice()` — public static — and `render_notice()`
+
+`set_notice()` is public and static because `Settings_Page::maybe_write_header_row()` reports
+through it too: that write happens on a plain page load, where the Settings API notice channel
+is no longer available.
 
 A one-shot notice stored in a **per-user transient** keyed `wtg_notice_{user_id}` with a
 60-second life. `render_notice()` prints it and immediately `delete_transient()`s it, so it

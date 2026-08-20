@@ -385,11 +385,13 @@ class Status_Tabs {
 		$this->map[ $name ] = $sheet_id;
 
 		// The tab is brand new and empty, so an append lands in row 1 — no need to
-		// check what is there first, unlike the manual "Write Header Row" button.
+		// check what is there first, unlike OAuth_Controller::write_header_row().
 		//
 		// A failure here is deliberately IGNORED: the tab exists and the order data
-		// still belongs in it, and a missing header is cosmetic and fixable from the
-		// settings page. Failing the whole sync over a heading would be worse.
+		// still belongs in it, and a missing header is cosmetic — the next save on
+		// the settings page rewrites row 1 of every existing tab, this one included
+		// (OAuth_Controller::write_header_row()). Failing the whole sync over a
+		// heading would be worse.
 		$header = Order_Mapper::header();
 
 		if ( ! empty( $header ) ) {

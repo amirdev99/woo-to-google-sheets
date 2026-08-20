@@ -103,6 +103,27 @@ class Settings_Page {
 	const CACHE_TTL = 600;
 
 	/**
+	 * Transient name (per user) meaning "this save wants the header row rewritten".
+	 *
+	 * Only the Fields tab ever sets it. The header row is that tab's business —
+	 * it is the form that decides the columns — and no other tab's Save button
+	 * touches the sheet. A connection change that invalidates row 1 marks it stale
+	 * instead (see sanitize()), leaving the write to the user.
+	 *
+	 * Deliberately NOT an instance property. sanitize() and the write cannot happen
+	 * in the same request: sanitize() must stay free of HTTP calls (it also runs
+	 * during the OAuth callback, and a failed Google call must never be able to
+	 * fail a settings save), and options.php redirects immediately afterwards.
+	 *
+	 * It is also deliberately not tied to the option changing. update_option()
+	 * fires NOTHING when the submitted values match what is already stored, so a
+	 * design hanging off update_option_{$option} silently does nothing when the
+	 * user presses Save a second time — which is exactly when someone whose sheet
+	 * header is wrong presses it.
+	 */
+	const HEADER_WRITE_FLAG = 'wtg_write_header_';
+
+	/**
 	 * Register the admin hooks. Called from Plugin::run() (in admin context).
 	 *
 	 * @return void
@@ -114,6 +135,12 @@ class Settings_Page {
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		// Must run before any output, so admin_init rather than during render.
 		add_action( 'admin_init', array( $this, 'maybe_refresh_lists' ) );
+
+		// Runs on the page load AFTER a save (options.php redirects back here),
+		// which is where the header write belongs: the settings are already safely
+		// stored, so a slow or failing Google call can only produce a notice, never
+		// a lost save. sanitize() decides whether there is anything to do.
+		add_action( 'admin_init', array( $this, 'maybe_write_header_row' ) );
 
 		// Deliberately on EVERY admin screen, not just ours. A shop owner who
 		// thinks the plugin is working has no reason to open its settings page —
@@ -296,10 +323,29 @@ class Settings_Page {
 			if ( '' !== $submitted_secret ) {
 				$output['client_secret'] = sanitize_text_field( $submitted_secret );
 			}
+
+			// Pointing the plugin at a different spreadsheet or tab means row 1 of
+			// the NEW sheet almost certainly does not match the selected columns.
+			// We deliberately do NOT write it here: the header row is owned by the
+			// Fields tab's Save button, the one place where the user is actually
+			// looking at the column layout. Saving a connection detail — a rotated
+			// client secret, say — must never reach into a sheet on its own.
+			//
+			// So we only mark it stale, which surfaces the amber "Header row out of
+			// date" notice and its recovery link on the Connection panel. The flag
+			// is set on $output rather than through Settings::set(), because we are
+			// inside sanitize_option_wtg_settings and that call would re-enter
+			// update_option() on the very option being written.
+			$target_changed = ( ( isset( $existing['spreadsheet_id'] ) ? $existing['spreadsheet_id'] : '' ) !== $output['spreadsheet_id'] )
+				|| ( ( isset( $existing['sheet_name'] ) ? $existing['sheet_name'] : '' ) !== $output['sheet_name'] );
+
+			if ( $target_changed && '' !== $output['spreadsheet_id'] ) {
+				$output['header_needs_write'] = true;
+			}
 		}
 
 		if ( 'fields' === $form ) {
-			$output = $this->sanitize_fields( $input, $output, $existing );
+			$output = $this->sanitize_fields( $input, $output );
 		}
 
 		if ( 'status_tabs' === $form ) {
@@ -313,7 +359,7 @@ class Settings_Page {
 		// keys (the form has no inputs for them), so we must pass them through
 		// when present; otherwise connecting would appear to succeed but the
 		// refresh token would be stripped and never saved.
-		foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_needed' ) as $internal_key ) {
+		foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_needed', 'header_needs_write' ) as $internal_key ) {
 			if ( array_key_exists( $internal_key, $input ) ) {
 				$output[ $internal_key ] = $input[ $internal_key ];
 			}
@@ -328,12 +374,11 @@ class Settings_Page {
 	/**
 	 * Sanitize the Fields tab: which columns to write, and what to call them.
 	 *
-	 * @param array $input    Raw submitted array.
-	 * @param array $output   Output built so far.
-	 * @param array $existing Previously stored settings, for change detection.
+	 * @param array $input  Raw submitted array.
+	 * @param array $output Output built so far.
 	 * @return array
 	 */
-	private function sanitize_fields( array $input, array $output, array $existing ) {
+	private function sanitize_fields( array $input, array $output ) {
 		$registry  = Order_Mapper::fields();
 		$submitted = ( isset( $input['fields'] ) && is_array( $input['fields'] ) ) ? $input['fields'] : array();
 
@@ -365,24 +410,95 @@ class Settings_Page {
 		}
 		$output['field_labels'] = $labels;
 
-		// If the layout actually changed, the sheet no longer matches. Say so
-		// rather than letting the user discover it as misaligned columns.
-		$before = isset( $existing['fields'] ) && is_array( $existing['fields'] ) ? $existing['fields'] : array();
-
-		// add_settings_error() lives in wp-admin/includes/template.php, which is
-		// NOT loaded on every request. sanitize() runs on every write to this
-		// option — including from admin-post.php during the OAuth callback — so
-		// guard it rather than assuming an admin-page context.
-		if ( $before !== $chosen && function_exists( 'add_settings_error' ) ) {
-			add_settings_error(
-				Settings::OPTION_KEY,
-				'wtg_layout_changed',
-				__( 'Column layout changed. Click "Write Header Row" on the Connection tab to update your sheet. Rows already in the sheet still use the old layout.', 'woo-to-gsheet' ),
-				'warning'
-			);
-		}
+		// Every save of this tab asks for the header, not only saves that changed
+		// something. "Press Save and the sheet matches" is the whole promise made
+		// by dropping the Write Header Row button, and it has to hold on the
+		// second press too — a header can be wrong for reasons this form never
+		// sees (someone edited row 1 in Google Sheets, an earlier write failed).
+		// An unnecessary ask is cheap: the write reads row 1 first and does
+		// nothing, silently, when it already matches.
+		$this->request_header_write();
 
 		return $output;
+	}
+
+	/**
+	 * Ask for the header row to be rewritten on the next admin page load.
+	 *
+	 * Called from sanitize(), which runs before the option is stored and must not
+	 * make HTTP calls, so the request is parked in a short-lived per-user
+	 * transient and picked up by maybe_write_header_row(). See HEADER_WRITE_FLAG.
+	 *
+	 * @return void
+	 */
+	private function request_header_write() {
+		set_transient( self::HEADER_WRITE_FLAG . get_current_user_id(), 1, MINUTE_IN_SECONDS );
+	}
+
+	/**
+	 * Write the sheet's header row on the page load after a settings save.
+	 *
+	 * Hooked to admin_init, and driven by the HEADER_WRITE_FLAG transient that
+	 * sanitize() sets. By the time we run, options.php has stored the settings and
+	 * redirected, so whatever Google does next, the save stands.
+	 *
+	 * Three deliberate behaviours:
+	 *
+	 *   - Nothing happens unless a save asked for it, so ordinary admin page loads
+	 *     and the plugin's own token writes cost no API call.
+	 *   - Nothing is attempted while there is no connection or no Spreadsheet ID.
+	 *     Someone half-way through setup would otherwise be met with a Google
+	 *     error for a step they have not reached yet; we just remember, and the
+	 *     Connection tab offers the link once connecting makes it possible.
+	 *   - Silence when every tab already said the right thing. "Already up to
+	 *     date" on every save is the noise that teaches people to ignore notices.
+	 *
+	 * @return void
+	 */
+	public function maybe_write_header_row() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$flag = self::HEADER_WRITE_FLAG . get_current_user_id();
+		if ( ! get_transient( $flag ) ) {
+			return;
+		}
+
+		// Clear FIRST, so a Google call that dies mid-request cannot leave a flag
+		// that retries the same failing call on every admin page load.
+		delete_transient( $flag );
+
+		// Not ready yet — remember it instead of failing at the user.
+		if ( ! ( new OAuth_Client() )->is_connected() || '' === Settings::get( 'spreadsheet_id', '' ) ) {
+			Settings::set( 'header_needs_write', true );
+			return;
+		}
+
+		$result = OAuth_Controller::write_header_row();
+
+		if ( OAuth_Controller::HEADER_UP_TO_DATE === $result ) {
+			return;
+		}
+
+		// Reported through OAuth_Controller's one-shot notice transient rather than
+		// add_settings_error(): this runs on a normal page load, after the Settings
+		// API has already flushed its own notices for the save.
+		$notice = OAuth_Controller::describe_header_result( $result );
+
+		if ( is_wp_error( $result ) ) {
+			OAuth_Controller::set_notice(
+				'error',
+				sprintf(
+					/* translators: %s: reason the header could not be written. */
+					__( 'Your settings were saved, but the header row in your sheet could not be updated: %s', 'woo-to-gsheet' ),
+					$notice['message']
+				)
+			);
+			return;
+		}
+
+		OAuth_Controller::set_notice( 'success', $notice['message'] );
 	}
 
 	/**
@@ -1080,7 +1196,7 @@ class Settings_Page {
 				<?php esc_html_e( 'Product, Quantity and Unit Price are the only fields that differ between the products in one order. If you include none of them, each order is written as a single row instead of one row per product.', 'woo-to-gsheet' ); ?>
 			</p>
 			<p class="description" style="max-width:820px;">
-				<?php esc_html_e( 'After changing this, click "Write Header Row" on the Connection tab. Rows already in your sheet keep the old layout.', 'woo-to-gsheet' ); ?>
+				<?php esc_html_e( 'Saving this page also rewrites row 1 of your sheet to match. Rows already in your sheet keep the old layout.', 'woo-to-gsheet' ); ?>
 			</p>
 
 			<?php submit_button(); ?>
@@ -1415,14 +1531,6 @@ class Settings_Page {
 				esc_url( OAuth_Controller::test_url() ),
 				esc_html__( 'Test Connection', 'woo-to-gsheet' )
 			);
-			// Writes the column labels into row 1 so the sheet always matches what
-			// the sync sends. Safe to click repeatedly; it refuses if row 1 holds
-			// order data. Only offered once connected, since it calls the API.
-			printf(
-				'<a href="%1$s" class="button button-secondary">%2$s</a> ',
-				esc_url( OAuth_Controller::write_header_url() ),
-				esc_html__( 'Write Header Row', 'woo-to-gsheet' )
-			);
 			printf(
 				'<a href="%1$s" class="button button-link-delete">%2$s</a>',
 				esc_url( OAuth_Controller::disconnect_url() ),
@@ -1439,6 +1547,27 @@ class Settings_Page {
 			} else {
 				echo '<p class="description" style="margin-bottom:0;">' . esc_html__( 'Enter your Client ID and Client Secret below and click Save Changes. A Connect button will then appear here.', 'woo-to-gsheet' ) . '</p>';
 			}
+		}
+
+		// The header is written as part of saving the Fields tab, so there is no
+		// permanent button for it: an action the plugin already performs on its own
+		// does not belong on the panel as a standing control. It appears only when
+		// row 1 is known to be out of date and this page cannot fix it by itself:
+		// the layout changed before the account was connected, row 1 holds real
+		// order data we refuse to overwrite, or the sheet target was just changed
+		// here — which marks the header stale but never writes to the new sheet.
+		if ( Settings::get( 'header_needs_write', false ) ) {
+			echo '<p style="margin-bottom:0;padding-top:8px;border-top:1px solid #f0f0f1;">';
+			echo '<span style="color:#dba617;font-weight:600;">&#9679; ' . esc_html__( 'Header row out of date', 'woo-to-gsheet' ) . '</span> &mdash; ';
+			echo esc_html__( 'row 1 of your sheet does not yet match the columns you selected.', 'woo-to-gsheet' );
+
+			if ( $oauth->is_connected() ) {
+				echo ' <a href="' . esc_url( OAuth_Controller::write_header_url() ) . '">' . esc_html__( 'Write header row now', 'woo-to-gsheet' ) . '</a>';
+			} else {
+				echo ' ' . esc_html__( 'Connect a Google account and it will be written automatically.', 'woo-to-gsheet' );
+			}
+
+			echo '</p>';
 		}
 
 		echo '</div>';

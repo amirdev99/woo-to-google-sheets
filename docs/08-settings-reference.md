@@ -108,6 +108,7 @@ These four have **no form fields**. They are written exclusively by `OAuth_Clien
 | `refresh_token` | `''` | string | `OAuth_Client::store_tokens()`, cleared by `disconnect()` / `flag_reauth_needed()` | `OAuth_Client::is_connected()`, `refresh_access_token()`, `disconnect()` |
 | `token_expires` | `0` | int (Unix ts) | `OAuth_Client::store_tokens()` | `OAuth_Client::is_token_expired()` |
 | `reauth_needed` | `false` | bool | `OAuth_Client::exchange_code()`, `disconnect()`, `flag_reauth_needed()` | `OAuth_Controller::render_reauth_notice()` |
+| `header_needs_write` | `false` | bool | `OAuth_Controller::write_header_row()`, `Settings_Page::maybe_write_header_row()` | `Settings_Page::render_connection_status()`, `OAuth_Controller::handle_callback()` |
 
 **`access_token`** — short-lived (about an hour). Never used directly; callers go through
 `get_valid_access_token()`, which refreshes transparently.
@@ -123,6 +124,15 @@ duration, so expiry is a simple comparison. `is_token_expired()` applies a 60-se
 meaning the refresh token is dead. Drives the persistent admin warning. Cleared on a
 successful connect and on an intentional disconnect.
 
+**`header_needs_write`** — set true when row 1 of the sheet is known to be out of line with the
+selected columns and could not be fixed then and there: no account connected yet, no
+Spreadsheet ID, a Google error, row 1 holding real order data the plugin refuses to overwrite,
+or the Connection tab having just been pointed at a different spreadsheet or tab (that save
+marks the header stale but deliberately never writes to the new sheet). It is the only thing
+that puts the "Write header row now" link on the Connection tab; the next successful write
+clears it. There is no button for the header otherwise — **saving the Fields tab** writes it,
+and that is the only Save button that does.
+
 ### ⚠️ The sanitize passthrough
 
 Because `Settings_Page::register_settings()` registers the option with a `sanitize_callback`,
@@ -132,7 +142,7 @@ including `OAuth_Client`'s own token writes, via the `sanitize_option_wtg_settin
 That is why `sanitize()` contains this loop:
 
 ```php
-foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_needed' ) as $internal_key ) {
+foreach ( array( 'access_token', 'refresh_token', 'token_expires', 'reauth_needed', 'header_needs_write' ) as $internal_key ) {
     if ( array_key_exists( $internal_key, $input ) ) {
         $output[ $internal_key ] = $input[ $internal_key ];
     }

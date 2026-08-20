@@ -161,7 +161,7 @@ user selected.
 
 **Depends on:** `WTG\Settings` — because column selection and custom headings are settings.
 **Called by:** `Queue\Sync_Processor::process()` (`map()`),
-`Admin\OAuth_Controller::handle_write_header()` (`header()`), and
+`AdminOAuth_Controller::write_header_row()` (`header()`), and
 `Admin\Settings_Page::render_fields_tab()` / `sanitize_fields()` (`fields()`, `is_locked()`).
 **Registers no hooks.**
 
@@ -238,7 +238,7 @@ columns.
 Returns the headings for the selected fields, applying any user override from
 `field_labels`, falling back to the registry's default label.
 
-This feeds the **Write Header Row** button, which is why the sheet's header can never
+This feeds the header write, which is why the sheet's header can never
 disagree with the data written beneath it — both come from here.
 
 ### `map( \WC_Order $order )`

@@ -53,6 +53,12 @@ class Settings {
 
 			// --- Connection health -------------------------------------------
 			'reauth_needed'  => false, // True when a refresh failed and the user must reconnect.
+			// True when the column layout changed but the sheet's row 1 could not
+			// be updated at the time (not connected yet, no Spreadsheet ID, a
+			// Google error, or row 1 holding real order data). Drives the manual
+			// recovery link on the Connection tab; cleared by the next successful
+			// write. See WTG\Admin\OAuth_Controller::write_header_row().
+			'header_needs_write' => false,
 
 			// --- Column selection (Fields tab) --------------------------------
 			// Ordered list of Order_Mapper field keys to write. An EMPTY array

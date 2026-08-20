@@ -14,6 +14,7 @@ namespace WTG\Admin;
 use WTG\Settings;
 use WTG\Google\OAuth_Client;
 use WTG\Google\Sheets_Client;
+use WTG\Sheets\Status_Tabs;
 use WTG\WooCommerce\Order_Mapper;
 
 // Block direct access.
@@ -45,6 +46,15 @@ class OAuth_Controller {
 	 * admin-post action that writes the column labels into row 1 of the sheet.
 	 */
 	const ACTION_WRITE_HEADER = 'wtg_write_header';
+
+	/**
+	 * write_header_row() return value meaning "row 1 already matched; nothing written".
+	 *
+	 * A distinct value rather than true/false, because callers genuinely need the
+	 * three-way distinction: written (say so), unchanged (stay quiet on an
+	 * automatic save), failed (warn).
+	 */
+	const HEADER_UP_TO_DATE = 'up_to_date';
 
 	/**
 	 * Nonce action used for the OAuth `state` parameter (CSRF for the callback).
@@ -129,7 +139,7 @@ class OAuth_Controller {
 
 		$oauth = new OAuth_Client();
 		if ( ! $oauth->has_credentials() ) {
-			$this->set_notice( 'error', __( 'Enter your Client ID and Client Secret first, then Save.', 'woo-to-gsheet' ) );
+			self::set_notice( 'error', __( 'Enter your Client ID and Client Secret first, then Save.', 'woo-to-gsheet' ) );
 			$this->redirect_to_settings();
 		}
 
@@ -159,7 +169,7 @@ class OAuth_Controller {
 		// Verify the state nonce Google echoed back.
 		$state = isset( $_GET['state'] ) ? sanitize_text_field( wp_unslash( $_GET['state'] ) ) : '';
 		if ( ! wp_verify_nonce( $state, self::STATE_ACTION ) ) {
-			$this->set_notice( 'error', __( 'Security check failed (invalid state). Please try connecting again.', 'woo-to-gsheet' ) );
+			self::set_notice( 'error', __( 'Security check failed (invalid state). Please try connecting again.', 'woo-to-gsheet' ) );
 			$this->redirect_to_settings();
 		}
 
@@ -167,21 +177,37 @@ class OAuth_Controller {
 		if ( isset( $_GET['error'] ) ) {
 			$error = sanitize_text_field( wp_unslash( $_GET['error'] ) );
 			/* translators: %s: error code from Google. */
-			$this->set_notice( 'error', sprintf( __( 'Google returned an error: %s', 'woo-to-gsheet' ), $error ) );
+			self::set_notice( 'error', sprintf( __( 'Google returned an error: %s', 'woo-to-gsheet' ), $error ) );
 			$this->redirect_to_settings();
 		}
 
 		$code = isset( $_GET['code'] ) ? sanitize_text_field( wp_unslash( $_GET['code'] ) ) : '';
 		if ( '' === $code ) {
-			$this->set_notice( 'error', __( 'No authorization code was returned by Google.', 'woo-to-gsheet' ) );
+			self::set_notice( 'error', __( 'No authorization code was returned by Google.', 'woo-to-gsheet' ) );
 			$this->redirect_to_settings();
 		}
 
 		$result = ( new OAuth_Client() )->exchange_code( $code );
 		if ( is_wp_error( $result ) ) {
-			$this->set_notice( 'error', $result->get_error_message() );
+			self::set_notice( 'error', $result->get_error_message() );
 		} else {
-			$this->set_notice( 'success', __( 'Google account connected successfully.', 'woo-to-gsheet' ) );
+			$message = __( 'Google account connected successfully.', 'woo-to-gsheet' );
+
+			// A column change made before connecting left the header unwritten.
+			// Now that there is a token, finish that job instead of making the
+			// user go and find the recovery link.
+			if ( Settings::get( 'header_needs_write', false ) ) {
+				$header = self::write_header_row();
+
+				// Silent on failure: the flag stays set, so the Connection tab
+				// they are about to land on explains it in its own words. Two
+				// notices about the same thing is one too many.
+				if ( is_array( $header ) ) {
+					$message .= ' ' . self::describe_header_result( $header )['message'];
+				}
+			}
+
+			self::set_notice( 'success', $message );
 		}
 
 		$this->redirect_to_settings();
@@ -196,7 +222,7 @@ class OAuth_Controller {
 		$this->authorize( self::ACTION_DISCONNECT );
 
 		( new OAuth_Client() )->disconnect();
-		$this->set_notice( 'success', __( 'Google account disconnected.', 'woo-to-gsheet' ) );
+		self::set_notice( 'success', __( 'Google account disconnected.', 'woo-to-gsheet' ) );
 
 		$this->redirect_to_settings();
 	}
@@ -214,22 +240,22 @@ class OAuth_Controller {
 		// get_valid_access_token() refreshes transparently if needed.
 		$token = $oauth->get_valid_access_token();
 		if ( is_wp_error( $token ) ) {
-			$this->set_notice( 'error', $token->get_error_message() );
+			self::set_notice( 'error', $token->get_error_message() );
 			$this->redirect_to_settings();
 		}
 
 		$spreadsheet_id = Settings::get( 'spreadsheet_id', '' );
 		if ( '' === $spreadsheet_id ) {
-			$this->set_notice( 'error', __( 'Enter a Spreadsheet ID first, then Save.', 'woo-to-gsheet' ) );
+			self::set_notice( 'error', __( 'Enter a Spreadsheet ID first, then Save.', 'woo-to-gsheet' ) );
 			$this->redirect_to_settings();
 		}
 
 		$title = $this->fetch_spreadsheet_title( $token, $spreadsheet_id );
 		if ( is_wp_error( $title ) ) {
-			$this->set_notice( 'error', $title->get_error_message() );
+			self::set_notice( 'error', $title->get_error_message() );
 		} else {
 			/* translators: %s: spreadsheet title. */
-			$this->set_notice( 'success', sprintf( __( 'Success! Connected to spreadsheet: %s', 'woo-to-gsheet' ), $title ) );
+			self::set_notice( 'success', sprintf( __( 'Success! Connected to spreadsheet: %s', 'woo-to-gsheet' ), $title ) );
 		}
 
 		$this->redirect_to_settings();
@@ -238,83 +264,245 @@ class OAuth_Controller {
 	/**
 	 * Write the column labels into row 1 of the configured sheet.
 	 *
-	 * The labels come from Order_Mapper::header(), the SAME source the sync uses
-	 * to build data rows, so the header can never disagree with what is written
-	 * beneath it.
-	 *
-	 * Row 1 may already hold something, so we read it first and branch four ways:
-	 *
-	 *   - blank            -> write the header
-	 *   - the same header  -> do nothing, report success (clicking twice is safe)
-	 *   - a different header -> overwrite it; that is the point of the button
-	 *   - ORDER DATA       -> refuse
-	 *
-	 * That last case matters: if syncing started before a header existed, row 1 is
-	 * a real order, and blindly writing over it would destroy a record. Refusing
-	 * matches how the processor already behaves when it cannot reconcile safely.
+	 * Thin wrapper: write_header_row() does the work, this turns its outcome into
+	 * an admin notice. Reaching this handler is now a RECOVERY path — an ordinary
+	 * column change writes the header as part of saving the form, in
+	 * Settings_Page::maybe_write_header_row().
 	 *
 	 * @return void
 	 */
 	public function handle_write_header() {
 		$this->authorize( self::ACTION_WRITE_HEADER );
 
+		$notice = self::describe_header_result( self::write_header_row() );
+		self::set_notice( $notice['type'], $notice['message'] );
+
+		$this->redirect_to_settings();
+	}
+
+	/**
+	 * Bring row 1 of every tab the plugin writes to in line with the current columns.
+	 *
+	 * The labels come from Order_Mapper::header(), the SAME source the sync uses
+	 * to build data rows, so the header can never disagree with what is written
+	 * beneath it.
+	 *
+	 * Row 1 of each tab may already hold something, so it is read first and
+	 * branched four ways — see attempt_header_write(), which does that work:
+	 *
+	 *   - blank              -> write the header
+	 *   - the same header    -> leave it alone (repeating is safe)
+	 *   - a different header -> overwrite it; that is the whole point
+	 *   - ORDER DATA         -> refuse
+	 *
+	 * That last case matters: if syncing started before a header existed, row 1 is
+	 * a real order, and blindly writing over it would destroy a record. Refusing
+	 * matches how the processor already behaves when it cannot reconcile safely.
+	 *
+	 * This method owns the `header_needs_write` flag: a failure here is what puts
+	 * the manual recovery link on the Connection tab, and the next success is
+	 * what takes it away, so no caller has to remember to do that bookkeeping.
+	 *
+	 * @return array|string|\WP_Error 'columns' + 'tabs' counts on a write,
+	 *                                self::HEADER_UP_TO_DATE, or WP_Error.
+	 */
+	public static function write_header_row() {
+		$result = self::attempt_header_write();
+		$needed = is_wp_error( $result );
+
+		// Only write the option when the flag actually flips. This can run inside
+		// an update_option hook, and a pointless nested write is just noise.
+		if ( (bool) Settings::get( 'header_needs_write', false ) !== $needed ) {
+			Settings::set( 'header_needs_write', $needed );
+		}
+
+		return $result;
+	}
+
+	/**
+	 * The header write itself, without the flag bookkeeping. See write_header_row().
+	 *
+	 * Every tab the plugin writes order rows into is brought in line, not just the
+	 * master one: with per-status tabs switched on, the same data layout is used
+	 * everywhere, so a stale heading in "Processing" mislabels its columns exactly
+	 * as it would in the master tab. The whole sweep costs three requests at most
+	 * — the tab map, one batched read of row 1, one batched write — regardless of
+	 * how many tabs exist.
+	 *
+	 * Tabs are judged INDEPENDENTLY: a tab whose row 1 holds order data is left
+	 * alone while the others are still corrected, and only then is the refusal
+	 * reported. Refusing the whole sweep because one tab is unusable would leave
+	 * the user with no way to fix any of them.
+	 *
+	 * @return array|string|\WP_Error 'columns' + 'tabs' counts, HEADER_UP_TO_DATE,
+	 *                                or WP_Error naming what could not be written.
+	 */
+	private static function attempt_header_write() {
 		// get_valid_access_token() refreshes transparently if needed.
 		$token = ( new OAuth_Client() )->get_valid_access_token();
 		if ( is_wp_error( $token ) ) {
-			$this->set_notice( 'error', $token->get_error_message() );
-			$this->redirect_to_settings();
+			return $token;
 		}
 
 		$spreadsheet_id = Settings::get( 'spreadsheet_id', '' );
 		if ( '' === $spreadsheet_id ) {
-			$this->set_notice( 'error', __( 'Enter a Spreadsheet ID first, then Save.', 'woo-to-gsheet' ) );
-			$this->redirect_to_settings();
-		}
-
-		$sheet_name = Settings::get( 'sheet_name', 'Sheet1' );
-		$sheets     = new Sheets_Client();
-
-		$existing = $sheets->read_row( $spreadsheet_id, $sheet_name, 1, $token );
-		if ( is_wp_error( $existing ) ) {
-			$this->set_notice( 'error', $existing->get_error_message() );
-			$this->redirect_to_settings();
+			return new \WP_Error( 'wtg_no_spreadsheet', __( 'Enter a Spreadsheet ID first, then Save.', 'woo-to-gsheet' ) );
 		}
 
 		$header = Order_Mapper::header();
-
-		// Already correct — nothing to do.
-		if ( $this->header_matches( $existing, $header ) ) {
-			$this->set_notice( 'success', __( 'The header row is already up to date.', 'woo-to-gsheet' ) );
-			$this->redirect_to_settings();
+		if ( empty( $header ) ) {
+			return self::HEADER_UP_TO_DATE; // No columns selected: nothing to write.
 		}
 
-		// Column A always holds the Order ID, so a NUMBER in A1 means row 1 is a
-		// synced order rather than a header. Text means it is a header we may replace.
-		if ( isset( $existing[0] ) && is_numeric( trim( (string) $existing[0] ) ) ) {
-			$this->set_notice(
-				'error',
-				__( 'Row 1 of your sheet contains order data, not a header. Insert a blank row above it in Google Sheets, then click Write Header Row again.', 'woo-to-gsheet' )
-			);
-			$this->redirect_to_settings();
+		$sheets = new Sheets_Client();
+		$tabs   = self::header_tabs( $sheets, $spreadsheet_id, $token );
+
+		$existing = $sheets->read_row_in_tabs( $spreadsheet_id, $tabs, 1, $token );
+		if ( is_wp_error( $existing ) ) {
+			return $existing;
 		}
 
-		// Reuses the same bounded write the sync uses; row 1, one row of values.
-		$result = $sheets->update_rows( $spreadsheet_id, $sheet_name, array( 1 ), array( $header ), $token );
+		$writes  = array();
+		$refused = array();
 
-		if ( is_wp_error( $result ) ) {
-			$this->set_notice( 'error', $result->get_error_message() );
-		} else {
-			$this->set_notice(
-				'success',
+		foreach ( $tabs as $tab ) {
+			$row = isset( $existing[ $tab ] ) ? $existing[ $tab ] : array();
+
+			// Already correct — leave this tab out of the write entirely.
+			if ( self::header_matches( $row, $header ) ) {
+				continue;
+			}
+
+			// Column A always holds the Order ID, so a NUMBER in A1 means row 1 is
+			// a synced order rather than a header. Text means it is a header we may
+			// replace.
+			if ( isset( $row[0] ) && is_numeric( trim( (string) $row[0] ) ) ) {
+				$refused[] = $tab;
+				continue;
+			}
+
+			$writes[ $tab ] = $header;
+		}
+
+		if ( ! empty( $writes ) ) {
+			$result = $sheets->update_row_in_tabs( $spreadsheet_id, $writes, 1, $token );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+		}
+
+		// Reported after the write, so the tabs that COULD be fixed already are.
+		if ( ! empty( $refused ) ) {
+			return new \WP_Error(
+				'wtg_header_row_occupied',
 				sprintf(
-					/* translators: %d: number of column labels written. */
-					__( 'Header row written: %d columns.', 'woo-to-gsheet' ),
-					count( $header )
+					/* translators: %s: comma-separated list of sheet tab names. */
+					_n(
+						'Row 1 of the %s tab contains order data, not a header. Insert a blank row above it in Google Sheets, then use the "Write header row now" link on the Connection tab.',
+						'Row 1 of these tabs contains order data, not a header: %s. Insert a blank row above it in Google Sheets, then use the "Write header row now" link on the Connection tab.',
+						count( $refused ),
+						'woo-to-gsheet'
+					),
+					implode( ', ', $refused )
 				)
 			);
 		}
 
-		$this->redirect_to_settings();
+		if ( empty( $writes ) ) {
+			return self::HEADER_UP_TO_DATE;
+		}
+
+		return array(
+			'columns' => count( $header ),
+			'tabs'    => count( $writes ),
+		);
+	}
+
+	/**
+	 * Every tab whose row 1 should carry the column headings.
+	 *
+	 * The master tab always, plus the per-status tabs that ALREADY EXIST. Ones
+	 * that have not been created yet are left out on purpose: a range naming a
+	 * missing tab fails the entire batched request, and a tab created later gets
+	 * its header from Status_Tabs at creation anyway.
+	 *
+	 * A failed tab-map read degrades to just the master tab rather than aborting.
+	 * Fixing the tab the shop owner is actually looking at beats fixing nothing.
+	 *
+	 * @param Sheets_Client $sheets         Client to reuse.
+	 * @param string        $spreadsheet_id Target spreadsheet.
+	 * @param string        $token          Valid access token.
+	 * @return string[]
+	 */
+	private static function header_tabs( Sheets_Client $sheets, $spreadsheet_id, $token ) {
+		$tabs = array( Settings::get( 'sheet_name', 'Sheet1' ) );
+
+		if ( ! Status_Tabs::is_enabled() ) {
+			return $tabs;
+		}
+
+		$existing = ( new Status_Tabs( $sheets, $spreadsheet_id, $token ) )->existing_tab_names();
+		if ( is_wp_error( $existing ) ) {
+			return $tabs;
+		}
+
+		// tab_names() already excludes the master tab, so no de-duplication is
+		// needed here — but a status tab named after the master one could never
+		// have got this far anyway (see Status_Tabs::tab_name_for()).
+		return array_merge( $tabs, $existing );
+	}
+
+	/**
+	 * Turn a write_header_row() return value into a notice type and message.
+	 *
+	 * Kept here so the manual button and the automatic write-on-save cannot drift
+	 * apart in what they tell the user, even though they print notices through
+	 * two different mechanisms (a transient vs. the Settings API).
+	 *
+	 * @param array|string|\WP_Error $result Whatever write_header_row() returned.
+	 * @return array Keys: 'type' ('success'|'error'), 'message'.
+	 */
+	public static function describe_header_result( $result ) {
+		if ( is_wp_error( $result ) ) {
+			return array(
+				'type'    => 'error',
+				'message' => $result->get_error_message(),
+			);
+		}
+
+		if ( ! is_array( $result ) ) {
+			// HEADER_UP_TO_DATE, or any future "nothing happened" value.
+			return array(
+				'type'    => 'success',
+				'message' => __( 'The header row is already up to date.', 'woo-to-gsheet' ),
+			);
+		}
+
+		$columns = isset( $result['columns'] ) ? (int) $result['columns'] : 0;
+		$tabs    = isset( $result['tabs'] ) ? (int) $result['tabs'] : 1;
+
+		// The tab count is only worth saying when there was more than one to write
+		// — on the common single-tab setup it would just be a confusing extra number.
+		if ( $tabs > 1 ) {
+			return array(
+				'type'    => 'success',
+				'message' => sprintf(
+					/* translators: 1: number of sheet tabs updated, 2: number of column labels written. */
+					__( 'Header row written to %1$d tabs: %2$d columns.', 'woo-to-gsheet' ),
+					$tabs,
+					$columns
+				),
+			);
+		}
+
+		return array(
+			'type'    => 'success',
+			'message' => sprintf(
+				/* translators: %d: number of column labels written. */
+				__( 'Header row written: %d columns.', 'woo-to-gsheet' ),
+				$columns
+			),
+		);
 	}
 
 	/* ---------------------------------------------------------------------- *
@@ -331,7 +519,7 @@ class OAuth_Controller {
 	 * @param array $header   Labels from Order_Mapper::header().
 	 * @return bool
 	 */
-	private function header_matches( array $existing, array $header ) {
+	private static function header_matches( array $existing, array $header ) {
 		if ( count( $existing ) !== count( $header ) ) {
 			return false;
 		}
@@ -403,11 +591,15 @@ class OAuth_Controller {
 	/**
 	 * Stash a one-time admin notice for the current user.
 	 *
+	 * Static because Settings_Page also needs it: the header write it triggers
+	 * happens on a plain page load, where the Settings API notice channel is not
+	 * available, so it reports through this same one-shot transient.
+	 *
 	 * @param string $type    'success' or 'error'.
 	 * @param string $message Human-readable message.
 	 * @return void
 	 */
-	private function set_notice( $type, $message ) {
+	public static function set_notice( $type, $message ) {
 		set_transient(
 			'wtg_notice_' . get_current_user_id(),
 			array(
